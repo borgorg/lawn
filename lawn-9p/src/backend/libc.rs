@@ -1,4 +1,4 @@
-use super::{Backend, FileKind, QIDMapper, Result, ToIdentifier};
+use super::{Backend, FileKind, QIDMapper, Result};
 use crate::server::{
     DirEntry, FileType, IsFlush, LinuxFileType, LinuxOpenMode, LinuxStat, LinuxStatValidity, Lock,
     LockCommand, LockKind, LockStatus, Metadata, PlainStat, ProtocolVersion, SimpleOpenMode, Stat,
@@ -7,159 +7,12 @@ use crate::server::{
 use lawn_constants::logger::{AsLogStr, Logger};
 use lawn_constants::Error;
 use lawn_fs::backend as fsbackend;
-use std::cmp;
 use std::convert::TryInto;
 use std::fs;
-use std::fs::File;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
-
-#[derive(Clone)]
-struct OpenFileID {
-    dev: u64,
-    ino: u64,
-    file: Arc<File>,
-    full_path: PathBuf,
-}
-
-impl ToIdentifier for OpenFileID {
-    fn to_identifier(&self) -> Vec<u8> {
-        let mut buf = [0u8; 8 + 8];
-        buf[0..8].copy_from_slice(&self.dev.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.ino.to_le_bytes());
-        buf.into()
-    }
-}
-
-impl Eq for OpenFileID {}
-
-impl PartialEq for OpenFileID {
-    fn eq(&self, other: &OpenFileID) -> bool {
-        self.cmp(other) == cmp::Ordering::Equal
-    }
-}
-
-impl PartialOrd for OpenFileID {
-    fn partial_cmp(&self, other: &OpenFileID) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OpenFileID {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.dev
-            .cmp(&other.dev)
-            .then_with(|| self.ino.cmp(&other.ino))
-            .then_with(|| self.file.as_raw_fd().cmp(&other.file.as_raw_fd()))
-            .then_with(|| self.full_path.cmp(&other.full_path))
-    }
-}
-
-impl IDInfo for OpenFileID {
-    fn dev(&self) -> u64 {
-        self.dev
-    }
-
-    fn ino(&self) -> u64 {
-        self.ino
-    }
-
-    fn file(&self) -> Option<Arc<File>> {
-        Some(self.file.clone())
-    }
-
-    fn full_path(&self) -> &Path {
-        &self.full_path
-    }
-
-    fn full_path_bytes(&self) -> &[u8] {
-        self.full_path.as_os_str().as_bytes()
-    }
-
-    fn file_kind(&self) -> Result<FileKind> {
-        Ok(FileKind::from_metadata(&self.file.metadata()?))
-    }
-}
-
-struct FileID {
-    dev: u64,
-    ino: u64,
-    full_path: PathBuf,
-}
-
-impl ToIdentifier for FileID {
-    fn to_identifier(&self) -> Vec<u8> {
-        let mut buf = [0u8; 8 + 8];
-        buf[0..8].copy_from_slice(&self.dev.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.ino.to_le_bytes());
-        buf.into()
-    }
-}
-
-impl Eq for FileID {}
-
-impl PartialEq for FileID {
-    fn eq(&self, other: &FileID) -> bool {
-        self.cmp(other) == cmp::Ordering::Equal
-    }
-}
-
-impl PartialOrd for FileID {
-    fn partial_cmp(&self, other: &FileID) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FileID {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.dev
-            .cmp(&other.dev)
-            .then_with(|| self.ino.cmp(&other.ino))
-            .then_with(|| self.full_path.cmp(&other.full_path))
-    }
-}
-
-impl IDInfo for FileID {
-    fn dev(&self) -> u64 {
-        self.dev
-    }
-
-    fn ino(&self) -> u64 {
-        self.ino
-    }
-
-    fn file(&self) -> Option<Arc<File>> {
-        None
-    }
-
-    fn full_path(&self) -> &Path {
-        &self.full_path
-    }
-
-    fn full_path_bytes(&self) -> &[u8] {
-        self.full_path.as_os_str().as_bytes()
-    }
-
-    fn file_kind(&self) -> Result<FileKind> {
-        Ok(FileKind::from_metadata(&fs::symlink_metadata(
-            &self.full_path,
-        )?))
-    }
-}
-
-trait IDInfo {
-    fn dev(&self) -> u64;
-    fn ino(&self) -> u64;
-    fn file(&self) -> Option<Arc<File>>;
-    fn full_path(&self) -> &Path;
-    fn full_path_bytes(&self) -> &[u8];
-    fn file_kind(&self) -> Result<FileKind>;
-}
 
 // These constants are arbitrary but are designed to not share byte patterns to help in debugging.
 // These fields are not otherwise used and so any dummy value is fine.
