@@ -1,0 +1,22 @@
+#!/bin/sh
+#/ update-version VERSION
+#/
+#/ Update the version number to VERSION (which may have a leading v or not) in
+#/ all the places necessary for a release.
+
+NEW_VERSION="$(echo "$1" | sed -e 's/^v//')"
+
+DIRS="lawn lawn-9p lawn-constants lawn-fs lawn-protocol lawn-sftp"
+FILES=$(printf '%s/Cargo.toml ' $DIRS)
+ruby -pi -e "BEGIN { VER = %Q[$NEW_VERSION]; }" -e '
+    BEGIN { state = :start }
+    if $_ =~ /^\[package\]$/
+        state = :package
+    elsif $_ =~ /\[dependencies\]$/
+        state = :dependencies
+    elsif $_ =~ /^version = / && state == :package
+        $_ = %Q[version = "#{VER}"\n]
+    elsif $_ =~ /^(lawn[a-z0-9-]+ = {.*version = )"[0-9.]+"(.*)$/
+        $_ = %Q[#{$1}"#{VER}"#{$2}\n]
+    end
+' $FILES
