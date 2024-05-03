@@ -943,8 +943,6 @@ pub trait CredentialHandle {
     async fn path(&self) -> Bytes;
 }
 
-pub trait CredentialSet {}
-
 // This value is serialized in some of the backends.  If you change it incompatibly, be sure to
 // separate that usage out into a separate struct.
 #[derive(Serialize, Deserialize, Default, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]

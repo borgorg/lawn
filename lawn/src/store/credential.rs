@@ -22,6 +22,7 @@ pub mod git;
 pub mod helpers;
 pub mod memory;
 
+#[allow(dead_code)]
 pub trait CredentialBackend {
     fn name(&self) -> &[u8];
     fn vaults(&self) -> Result<Cow<'_, [Bytes]>, CredentialParserError>;
@@ -53,8 +54,8 @@ pub trait CredentialBackend {
     fn authentication_metadata(&self) -> Option<StoreAuthenticationMetadata>;
 }
 
+#[allow(dead_code)]
 pub trait CredentialBackendHandle {
-    fn config(&self) -> Arc<Config>;
     fn store_id(&self) -> StoreID;
     fn id(&self) -> StoreSelectorID;
     fn to_store_element_entry(self: Arc<Self>) -> Arc<dyn StoreElementEntry + Send + Sync>;
@@ -190,10 +191,6 @@ impl StoreElement for TopLevelCredentialBackendHandle {
 }
 
 impl CredentialBackendHandle for TopLevelCredentialBackendHandle {
-    fn config(&self) -> Arc<Config> {
-        self.config.clone()
-    }
-
     fn store_id(&self) -> StoreID {
         self.store_id
     }
@@ -459,6 +456,7 @@ impl<T: CredentialBackendHandle> StoreElement for CredentialBackendStoreElement<
     }
 }
 
+#[allow(dead_code)]
 pub trait CredentialVault: StoreElement {
     fn name(&self) -> &[u8];
     fn search(
