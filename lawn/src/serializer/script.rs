@@ -61,17 +61,11 @@ impl ScriptEncoder {
         Self {}
     }
 
-    pub fn encode<'a, T: Encodable>(&self, val: &'a T) -> Cow<'a, [u8]>
-    where
-        T: ?Sized,
-    {
+    pub fn encode<'a, T: Encodable + ?Sized>(&self, val: &'a T) -> Cow<'a, [u8]> {
         val.encode()
     }
 
-    pub fn encode_to_bytes<T: Encodable>(&self, val: &T) -> Bytes
-    where
-        T: ?Sized,
-    {
+    pub fn encode_to_bytes<T: Encodable + ?Sized>(&self, val: &T) -> Bytes {
         val.encode_to_bytes()
     }
 

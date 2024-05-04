@@ -482,14 +482,14 @@ impl LibcBackend {
         dest: PathBuf,
         st: &'_ mut WalkState<'_>,
     ) -> Result<QID> {
-        st.full_path = dest.clone();
+        st.full_path.clone_from(&dest);
         // If this is the last component, we don't need to try to open it since we're not walking a
         // directory.
         if st.last {
             let metadata = fs::symlink_metadata(&dest)?;
             let ft = QIDKind::from_metadata(&metadata);
             st.kind = ft;
-            st.next_full_path = st.full_path.clone();
+            st.next_full_path.clone_from(&st.full_path);
             st.file = None;
             st.dev = metadata.dev();
             st.ino = metadata.ino();
@@ -513,7 +513,7 @@ impl LibcBackend {
                     QID::default()
                 };
                 st.kind = qid.kind();
-                st.next_full_path = st.full_path.clone();
+                st.next_full_path.clone_from(&st.full_path);
                 st.file = Some(Arc::new(fd));
                 st.dev = qid.dev();
                 st.ino = qid.ino();
@@ -561,7 +561,7 @@ impl LibcBackend {
                     )?),
                 };
                 st.kind = QIDKind::Directory;
-                st.next_full_path = st.full_path.clone();
+                st.next_full_path.clone_from(&st.full_path);
                 st.file = Some(file);
                 st.dev = qid.dev();
                 st.ino = qid.ino();
@@ -1107,8 +1107,8 @@ impl Backend for LibcBackend {
                 (_, Err(_)) => break,
             }
             if !last {
-                st.full_path = st.next_full_path.clone();
-                st.dir = st.file.clone();
+                st.full_path.clone_from(&st.next_full_path);
+                st.dir.clone_from(&st.file);
                 st.file = None;
             }
         }

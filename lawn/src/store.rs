@@ -101,6 +101,7 @@ impl StoreAuthenticationMetadata {
     }
 }
 
+#[allow(dead_code)]
 pub trait StoreElementEntry {
     fn store_id(&self) -> StoreID;
     fn path(&self) -> Bytes;
@@ -173,6 +174,7 @@ impl StoreElementEntry for PlainStoreElementEntry {
 type BoxedStoreElementEntryIterator =
     Box<dyn Iterator<Item = Arc<dyn StoreElementEntry + Send + Sync>> + Send + Sync>;
 
+#[allow(dead_code)]
 pub trait StoreElement {
     fn store_id(&self) -> StoreID;
     fn id(&self) -> StoreSelectorID;
@@ -224,6 +226,7 @@ pub trait StoreElement {
     >;
 }
 
+#[allow(dead_code)]
 pub trait Store {
     fn id(&self) -> StoreID;
     fn acquire(

@@ -317,9 +317,9 @@ impl GitProtocolHandler {
             cred.location = vec![loc];
         }
         if cred.service.is_none() {
-            cred.service = self.service.clone();
+            cred.service.clone_from(&self.service);
         }
-        cred.kind = self.kind.clone();
+        cred.kind.clone_from(&self.kind);
         cred.title = (*self.titler)(&cred);
         cred.id = id.unwrap_or_else(|| cred.generate_id());
         if has_secret || !need_secret {

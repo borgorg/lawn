@@ -224,10 +224,6 @@ impl<
         U: CommandCredentialBackend<Backend = T> + Send + Sync + 'static,
     > CredentialBackendHandle for CommandCredentialBackendHandle<T, U>
 {
-    fn config(&self) -> Arc<Config> {
-        self.parent.clone().config()
-    }
-
     fn store_id(&self) -> StoreID {
         self.store_id
     }
