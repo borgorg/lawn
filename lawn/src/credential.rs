@@ -102,7 +102,7 @@ impl Drop for ConnectionWrapper {
 }
 
 pub enum CredentialObject {
-    Credential(Credential),
+    Credential,
     Store(CredentialStore),
     Vault(CredentialVault),
     Directory(CredentialDirectory),
@@ -233,7 +233,7 @@ impl CredentialClient {
             }
             Some(CredentialPathComponentType::Entry) => {
                 match handle.get_entry_from_path(path).await {
-                    Ok(Some(c)) => Ok(Some(CredentialObject::Credential(c))),
+                    Ok(Some(_)) => Ok(Some(CredentialObject::Credential)),
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 }

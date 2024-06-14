@@ -712,7 +712,7 @@ impl CommandCredentialBackend for MemoryCredentialBackend {
             .vaults
             .vaults()
             .ok_or(ResponseCode::NeedsAuthentication)?
-            .write()
+            .read()
             .unwrap();
         let path = elem.path();
         let store_id = elem.store_id();
