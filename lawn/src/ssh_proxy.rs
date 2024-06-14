@@ -5,6 +5,7 @@ use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use std::convert::TryInto;
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -701,7 +702,9 @@ impl Proxy {
         }
         {
             let slice = unsafe {
-                std::mem::transmute::<_, &mut [u8]>(&mut v.spare_capacity_mut()[0..datalen])
+                std::mem::transmute::<&mut [MaybeUninit<u8>], &mut [u8]>(
+                    &mut v.spare_capacity_mut()[0..datalen],
+                )
             };
             ssh.read_exact(slice).await?;
             unsafe { v.set_len(datalen) };
