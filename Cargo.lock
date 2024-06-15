@@ -295,7 +295,7 @@ checksum = "af150ab688ff2122fcef229be89cb50dd66af9e01a4ff320cc137eecc9bacc38"
 
 [[package]]
 name = "lawn"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "lawn-9p"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bitflags",
  "flurry",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "lawn-constants"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "num-derive",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "lawn-fs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bitflags",
  "flurry",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "lawn-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bitflags",
  "bytes",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "lawn-sftp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bitflags",
  "flurry",

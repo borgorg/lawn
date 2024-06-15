@@ -1,5 +1,32 @@
 = Changelog
 
+== v0.4.0
+
+=== Project
+
+* Start signing releases with an SSH certificate.
+* Avoid running CI twice on push and pull request.
+
+=== Binary
+
+* Add timeouts for `lawn proxy` polling.
+* Add experimental support for accessing credentials.
+* Add a memory backend for credentials.
+* Bump MSRV to 1.63 to fix security issues.
+* Update several crates to address security issues.
+* Implement reading socket information from the environment.
+* Allow querying data from Lawn callbacks.
+* Substantially improve performance for `lawn proxy` (about 500×).
+
+=== Protocol and Internals
+
+* Start testing against Miri.
+* Add support for credential stores.
+* Add support for `store=credential`.
+* Add support for `context=template`.
+* Add support for `auth=PLAIN`.
+* Add support for `auth=keyboard-interactive`.
+
 == v0.3.0
 
 === Binary
