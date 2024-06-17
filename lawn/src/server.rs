@@ -938,9 +938,12 @@ impl Server {
                 };
                 let selector = m.selector;
                 let count = m.count;
-                let data = tokio::task::spawn_blocking(move || ch.read(selector, count))
-                    .await
-                    .unwrap()?;
+                let sync = m.stream_sync;
+                let blocking = m.blocking;
+                let data =
+                    tokio::task::spawn_blocking(move || ch.read(selector, count, sync, blocking))
+                        .await
+                        .unwrap()?;
                 let resp = protocol::ReadChannelResponse { bytes: data };
                 Ok((ResponseType::Success, serializer.serialize_body(&resp)))
             }
@@ -954,9 +957,12 @@ impl Server {
                 };
                 let selector = m.selector;
                 let bytes = m.bytes;
-                let n = tokio::task::spawn_blocking(move || ch.write(selector, bytes))
-                    .await
-                    .unwrap()?;
+                let sync = m.stream_sync;
+                let blocking = m.blocking;
+                let n =
+                    tokio::task::spawn_blocking(move || ch.write(selector, bytes, sync, blocking))
+                        .await
+                        .unwrap()?;
                 let resp = protocol::WriteChannelResponse { count: n };
                 Ok((ResponseType::Success, serializer.serialize_body(&resp)))
             }

@@ -83,6 +83,7 @@ pub struct Connection {
     config: Arc<Config>,
     path: Option<PathBuf>,
     handler: Arc<ProtocolHandler<OwnedReadHalf, OwnedWriteHalf>>,
+    capabilities: tokio::sync::RwLock<BTreeSet<protocol::Capability>>,
 }
 
 impl Connection {
@@ -100,6 +101,7 @@ impl Connection {
             config,
             path: path.map(|p| p.into()),
             handler,
+            capabilities: tokio::sync::RwLock::new(BTreeSet::new()),
         })
     }
 
@@ -129,6 +131,12 @@ impl Connection {
     }
 
     #[allow(clippy::mutable_key_type)]
+    pub async fn set_capabilities(&self, set: BTreeSet<protocol::Capability>) {
+        let mut g = self.capabilities.write().await;
+        *g = set;
+    }
+
+    #[allow(clippy::mutable_key_type)]
     pub async fn negotiate_default_version(&self) -> Result<CapabilityResponse, Error> {
         let resp: CapabilityResponse = match self
             .handler
@@ -148,7 +156,7 @@ impl Connection {
             .cloned()
             .map(|c| c.into())
             .collect();
-        let intersection = ours
+        let intersection: Vec<_> = ours
             .intersection(&theirs)
             .map(|x| (*x).clone().into())
             .collect();
@@ -162,13 +170,15 @@ impl Connection {
         );
         let req = VersionRequest {
             version: 0,
-            enable: intersection,
+            enable: intersection.clone(),
             id: None,
             user_agent: Some(crate::config::VERSION.into()),
         };
         self.handler
             .send_message::<_, Empty, Empty>(MessageKind::Version, &req, Some(true))
             .await?;
+        let mut g = self.capabilities.write().await;
+        *g = intersection.iter().cloned().map(|x| x.into()).collect();
         Ok(resp)
     }
 
@@ -961,10 +971,20 @@ impl Connection {
     }
 
     async fn read_channel(self: Arc<Self>, id: ChannelID, selector: u32) -> Result<Bytes, Error> {
+        let blocking = {
+            let capa = self.capabilities.read().await;
+            if capa.contains(&protocol::Capability::ChannelBlockingIO) {
+                Some(true)
+            } else {
+                None
+            }
+        };
         let req = ReadChannelRequest {
             id,
             selector,
             count: 65536,
+            stream_sync: None,
+            blocking,
         };
         let resp: ReadChannelResponse = match self
             .handler
@@ -986,10 +1006,20 @@ impl Connection {
         selector: u32,
         data: &[u8],
     ) -> Result<u64, Error> {
+        let blocking = {
+            let capa = self.capabilities.read().await;
+            if capa.contains(&protocol::Capability::ChannelBlockingIO) {
+                Some(true)
+            } else {
+                None
+            }
+        };
         let req = WriteChannelRequest {
             id,
             selector,
             bytes: data.to_vec().into(),
+            stream_sync: None,
+            blocking,
         };
         let resp: WriteChannelResponse = match self
             .handler

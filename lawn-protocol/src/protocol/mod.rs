@@ -323,6 +323,7 @@ pub enum Capability {
     Channel9P,
     ChannelSFTP,
     ChannelClipboard,
+    ChannelBlockingIO,
     ExtensionAllocate,
     StoreCredential,
     ContextTemplate,
@@ -340,6 +341,7 @@ impl Capability {
             Self::ChannelClipboard,
             Self::Channel9P,
             Self::ChannelSFTP,
+            Self::ChannelBlockingIO,
             Self::ExtensionAllocate,
             Self::StoreCredential,
             Self::ContextTemplate,
@@ -359,6 +361,7 @@ impl Capability {
                 | Self::ChannelClipboard
                 | Self::Channel9P
                 | Self::ChannelSFTP
+                | Self::ChannelBlockingIO
                 | Self::ExtensionAllocate
                 | Self::StoreCredential
                 | Self::ContextTemplate
@@ -391,6 +394,10 @@ impl From<Capability> for (Bytes, Option<Bytes>) {
                 (b"channel" as &[u8]).into(),
                 Some((b"clipboard" as &[u8]).into()),
             ),
+            Capability::ChannelBlockingIO => (
+                (b"channel" as &[u8]).into(),
+                Some((b"blocking-io" as &[u8]).into()),
+            ),
             Capability::StoreCredential => (
                 (b"store" as &[u8]).into(),
                 Some((b"credential" as &[u8]).into()),
@@ -418,6 +425,7 @@ impl From<(&[u8], Option<&[u8]>)> for Capability {
             (b"channel", Some(b"9p")) => Capability::Channel9P,
             (b"channel", Some(b"sftp")) => Capability::ChannelSFTP,
             (b"channel", Some(b"clipboard")) => Capability::ChannelClipboard,
+            (b"channel", Some(b"blocking-io")) => Capability::ChannelBlockingIO,
             (b"store", Some(b"credential")) => Capability::StoreCredential,
             (b"extension", Some(b"allocate")) => Capability::ExtensionAllocate,
             (b"context", Some(b"template")) => Capability::ContextTemplate,
@@ -550,6 +558,10 @@ pub struct ReadChannelRequest {
     pub id: ChannelID,
     pub selector: u32,
     pub count: u64,
+    #[serde(default)]
+    pub stream_sync: Option<u64>,
+    #[serde(default)]
+    pub blocking: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
@@ -564,6 +576,10 @@ pub struct WriteChannelRequest {
     pub id: ChannelID,
     pub selector: u32,
     pub bytes: Bytes,
+    #[serde(default)]
+    pub stream_sync: Option<u64>,
+    #[serde(default)]
+    pub blocking: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
