@@ -20,64 +20,14 @@ use num_traits::FromPrimitive;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::select;
 use tokio::task::JoinHandle;
-use tokio::time;
-
-#[derive(Clone)]
-pub struct FDStatus {
-    open: bool,
-    last: bool,
-    data: Option<Vec<u8>>,
-}
-
-impl FDStatus {
-    /// Returns true if read_command_fd should be called again when draining this stream.
-    fn needs_final_read(&self) -> bool {
-        self.open && self.last
-    }
-
-    /// Returns true if read_command_fd should be called again when draining this stream.
-    fn needs_final_write(&self) -> bool {
-        self.open
-    }
-
-    /// Returns true if read_command_fd should be called again.
-    fn needs_read(&self) -> bool {
-        self.open && self.last
-    }
-
-    /// Returns true if write_command_fd should be called again.
-    fn needs_write(&self) -> bool {
-        self.open && self.last
-    }
-
-    fn closed() -> FDStatus {
-        FDStatus {
-            open: false,
-            last: false,
-            data: None,
-        }
-    }
-}
-
-impl Default for FDStatus {
-    fn default() -> FDStatus {
-        FDStatus {
-            open: true,
-            last: false,
-            data: None,
-        }
-    }
-}
 
 pub struct Connection {
     config: Arc<Config>,
@@ -411,16 +361,8 @@ impl Connection {
             .unwrap();
         let id = self.create_clipboard_channel(op, target).await?;
         match op {
-            ClipboardChannelOperation::Copy => {
-                let mut fd_status = [FDStatus::default(), FDStatus::closed()];
-                self.run_channel(stdin, devnull, stderr, id, &mut fd_status)
-                    .await
-            }
-            ClipboardChannelOperation::Paste => {
-                let mut fd_status = [FDStatus::closed(), FDStatus::default()];
-                self.run_channel(devnull, stdout, stderr, id, &mut fd_status)
-                    .await
-            }
+            ClipboardChannelOperation::Copy => self.run_channel(stdin, devnull, stderr, id).await,
+            ClipboardChannelOperation::Paste => self.run_channel(devnull, stdout, stderr, id).await,
         }
     }
 
@@ -440,9 +382,7 @@ impl Connection {
             .await
             .unwrap();
         let id = self.create_9p_channel(target).await?;
-        let mut fd_status = [FDStatus::default(), FDStatus::default()];
-        self.run_channel(stdin, stdout, devnull, id, &mut fd_status)
-            .await
+        self.run_channel(stdin, stdout, devnull, id).await
     }
 
     pub async fn run_sftp<
@@ -461,9 +401,7 @@ impl Connection {
             .await
             .unwrap();
         let id = self.create_sftp_channel(target).await?;
-        let mut fd_status = [FDStatus::default(), FDStatus::default()];
-        self.run_channel(stdin, stdout, devnull, id, &mut fd_status)
-            .await
+        self.run_channel(stdin, stdout, devnull, id).await
     }
 
     pub async fn run_command<
@@ -478,13 +416,7 @@ impl Connection {
         stderr: E,
     ) -> Result<i32, Error> {
         let id = self.create_command_channel(args).await?;
-        let mut fd_status = [
-            FDStatus::default(),
-            FDStatus::default(),
-            FDStatus::default(),
-        ];
-        self.run_channel(stdin, stdout, stderr, id, &mut fd_status)
-            .await
+        self.run_channel(stdin, stdout, stderr, id).await
     }
 
     async fn run_channel<
@@ -497,7 +429,6 @@ impl Connection {
         stdout: O,
         stderr: E,
         id: ChannelID,
-        _fd_status: &mut [FDStatus],
     ) -> Result<i32, Error> {
         let rhandler = self.handler.clone();
         let (finaltx, mut finalrx) = tokio::sync::mpsc::channel(1);
@@ -711,263 +642,6 @@ impl Connection {
         };
         trace!(logger, "channel {}: poll: response", id);
         Ok(resp.selectors)
-    }
-
-    async fn write_command_fd<T: AsyncWriteExt + Unpin>(
-        self: Arc<Self>,
-        id: ChannelID,
-        selector: u32,
-        st: &FDStatus,
-        io: &mut T,
-    ) -> FDStatus {
-        let logger = self.config.logger();
-        if !st.open {
-            trace!(logger, "channel {}: closed selector {}", id, selector);
-            return st.clone();
-        }
-        let read_data;
-        let data: &[u8] = match &st.data {
-            Some(data) if !data.is_empty() => data,
-            Some(_) | None => {
-                trace!(
-                    logger,
-                    "channel {}: {}: about to read from channel",
-                    id,
-                    selector
-                );
-                match self.clone().read_channel(id, selector).await {
-                    Ok(data) => {
-                        trace!(
-                            logger,
-                            "channel {}: {}: read channel: {} bytes",
-                            id,
-                            selector,
-                            data.len()
-                        );
-                        read_data = data;
-                        &read_data
-                    }
-                    Err(e) => {
-                        trace!(
-                            logger,
-                            "channel {}: {}: read channel: error {}",
-                            id,
-                            selector,
-                            e
-                        );
-                        use std::error::Error;
-                        if let Some(e) = e.source() {
-                            if let Some(e) = e.downcast_ref::<protocol::Error>() {
-                                let e: Result<std::io::Error, _> = e.clone().try_into();
-                                if let Ok(e) = e {
-                                    match e.kind() {
-                                        std::io::ErrorKind::BrokenPipe => {
-                                            return FDStatus {
-                                                open: false,
-                                                last: false,
-                                                data: None,
-                                            }
-                                        }
-                                        std::io::ErrorKind::WouldBlock => {
-                                            return FDStatus {
-                                                open: true,
-                                                last: false,
-                                                data: None,
-                                            }
-                                        }
-                                        _ => return st.clone(),
-                                    }
-                                }
-                            }
-                        }
-                        return FDStatus {
-                            open: true,
-                            last: false,
-                            data: None,
-                        };
-                    }
-                }
-            }
-        };
-        if data.is_empty() {
-            self.clone().detach_channel_selector(id, selector).await;
-            return FDStatus {
-                open: false,
-                last: false,
-                data: None,
-            };
-        }
-        trace!(
-            logger,
-            "channel {}: {}: about to write {} bytes to fd",
-            id,
-            selector,
-            data.len()
-        );
-        match io.write(data).await {
-            Ok(n) if n == data.len() => FDStatus {
-                open: true,
-                last: true,
-                data: None,
-            },
-            Ok(n) => FDStatus {
-                open: true,
-                last: true,
-                data: Some(data[n..].into()),
-            },
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::BrokenPipe => {
-                    self.clone().detach_channel_selector(id, selector).await;
-                    FDStatus {
-                        open: false,
-                        last: false,
-                        data: Some(data.into()),
-                    }
-                }
-                std::io::ErrorKind::WouldBlock => FDStatus {
-                    open: true,
-                    last: false,
-                    data: Some(data.into()),
-                },
-                _ => {
-                    trace!(logger, "channel {}: {}: error writing: {}", id, selector, e);
-                    FDStatus {
-                        open: true,
-                        last: false,
-                        data: Some(data.into()),
-                    }
-                }
-            },
-        }
-    }
-
-    async fn read_command_fd<T: AsyncReadExt + Unpin>(
-        self: Arc<Self>,
-        id: ChannelID,
-        selector: u32,
-        st: &FDStatus,
-        io: &mut T,
-    ) -> FDStatus {
-        let logger = self.config.logger();
-        if !st.open {
-            trace!(logger, "channel {}: closed selector {}", id, selector);
-            return st.clone();
-        }
-        let mut buf = vec![0; 65536];
-        let data = match &st.data {
-            Some(data) => data,
-            None => {
-                let mut interval = time::interval(Duration::from_millis(10));
-                trace!(
-                    logger,
-                    "channel {}: {}: about to read from fd",
-                    id,
-                    selector
-                );
-                select! {
-                    res = io.read(&mut buf) => {
-                        trace!(logger, "channel {}: {}: got {:?} on read", id, selector, res);
-                        match res {
-                            Ok(0) => {
-                                trace!(logger, "channel {}: {}: eof on read", id, selector);
-                                self.detach_channel_selector(id, selector).await;
-                                return FDStatus{open: false, last: false, data: None};
-                            },
-                            Ok(n) => &buf[0..n],
-                            Err(_) => return st.clone(),
-                        }
-                    }
-                    _ = interval.tick() => {
-                        trace!(logger, "channel {}: {}: nothing to read", id, selector);
-                        return FDStatus{open: st.open, last: false, data: st.data.clone()};
-                    }
-                }
-            }
-        };
-        trace!(
-            logger,
-            "channel {}: {}: about to write {} bytes to channel",
-            id,
-            selector,
-            data.len()
-        );
-        match self.write_channel(id, selector, data).await {
-            Ok(x) if x == data.len() as u64 => {
-                trace!(
-                    logger,
-                    "channel {}: {}: write channel: {} bytes",
-                    id,
-                    selector,
-                    x
-                );
-                FDStatus {
-                    open: true,
-                    last: true,
-                    data: None,
-                }
-            }
-            Ok(x) => {
-                trace!(
-                    logger,
-                    "channel {}: {}: write channel: {} bytes",
-                    id,
-                    selector,
-                    x
-                );
-                FDStatus {
-                    open: true,
-                    last: true,
-                    data: Some(data[(x as usize)..].to_vec()),
-                }
-            }
-            Err(e) => {
-                trace!(
-                    logger,
-                    "channel {}: {}: write channel: error {}",
-                    id,
-                    selector,
-                    e
-                );
-                use std::error::Error;
-                if let Some(e) = e.source() {
-                    if let Some(handler::Error::ProtocolError(e)) =
-                        e.downcast_ref::<handler::Error>()
-                    {
-                        let e: Result<std::io::Error, _> = e.clone().try_into();
-                        if let Ok(e) = e {
-                            match e.kind() {
-                                std::io::ErrorKind::BrokenPipe => {
-                                    return FDStatus {
-                                        open: false,
-                                        last: false,
-                                        data: None,
-                                    }
-                                }
-                                std::io::ErrorKind::WouldBlock => {
-                                    return FDStatus {
-                                        open: true,
-                                        last: false,
-                                        data: Some(data.to_vec()),
-                                    }
-                                }
-                                _ => {
-                                    return FDStatus {
-                                        open: true,
-                                        last: false,
-                                        data: Some(data.to_vec()),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                FDStatus {
-                    open: true,
-                    last: false,
-                    data: Some(data.to_vec()),
-                }
-            }
-        }
     }
 
     async fn read_channel(self: Arc<Self>, id: ChannelID, selector: u32) -> Result<Bytes, Error> {
