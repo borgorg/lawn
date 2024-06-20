@@ -139,6 +139,9 @@ v0:
         echo:
             if: true
             command: '!f() { printf \"$@\"; };f'
+        sha256sum:
+            if: true
+            command: '!f() { if command -v sha256sum >/dev/null 2>/dev/null; then sha256sum \"$@\"; else shasum -a 256 -b \"$@\"; fi; };f'
 "
     }
 
@@ -1228,6 +1231,81 @@ fn rejects_store_auth_with_disallowed_types() {
             );
         });
     }
+}
+
+fn test_data_streaming(ti: Arc<TestInstance>) {
+    with_server(ti.clone(), async move {
+        // Basic setup.
+        let c = ti.connection().await;
+        c.ping().await.unwrap();
+        let resp = c.negotiate_default_version().await.unwrap();
+        assert_eq!(resp.version, &[0], "version is correct");
+        assert_eq!(
+            resp.user_agent.unwrap(),
+            config::VERSION,
+            "user-agent is correct"
+        );
+        c.auth_external().await.unwrap();
+
+        let mut buf = vec![0u8; 1024 * 1024];
+        {
+            use rand::Rng;
+
+            let prng = ti.config().prng();
+            let mut prng = prng.lock().unwrap();
+            prng.fill(buf.as_mut_slice());
+        }
+        let input = std::io::Cursor::new(buf);
+        let mut outpathbuf = ti.tempdir().to_owned();
+        outpathbuf.push("stdout");
+        let mut errpathbuf = ti.tempdir().to_owned();
+        errpathbuf.push("stderr");
+
+        let stdout = tokio::fs::File::create(&outpathbuf).await.unwrap();
+        let stderr = tokio::fs::File::create(&errpathbuf).await.unwrap();
+
+        let args: &[Bytes] = &[
+            Bytes::from(b"sha256sum".as_slice()),
+            Bytes::from(b"-b".as_slice()),
+        ];
+
+        assert_eq!(
+            c.run_command(args, input, stdout, stderr).await.unwrap(),
+            0,
+            "exit status of command is 0"
+        );
+        let outbuf = tokio::fs::read(&outpathbuf).await.unwrap();
+        let errbuf = tokio::fs::read(&errpathbuf).await.unwrap();
+        assert_eq!(errbuf, b"", "no stderr");
+        assert_eq!(
+            outbuf, b"03092c09661027f16e879005cf9f460dd4e6ae32c12f32795d1715fee281030f *-\n",
+            "expected stdout"
+        );
+    });
+}
+
+#[test]
+fn can_stream_data_correctly_in_blocking_mode() {
+    let mut capabilities = Capability::implemented();
+    capabilities.insert(Capability::ChannelBlockingIO);
+
+    let mut cb = ConfigBuilder::new();
+    cb.capabilities(capabilities);
+
+    let ti = Arc::new(TestInstance::new(Some(cb), None));
+    test_data_streaming(ti);
+}
+
+#[test]
+fn can_stream_data_correctly_in_nonblocking_mode() {
+    let mut capabilities = Capability::implemented();
+    capabilities.remove(&Capability::ChannelBlockingIO);
+
+    let mut cb = ConfigBuilder::new();
+    cb.capabilities(capabilities);
+
+    let ti = Arc::new(TestInstance::new(Some(cb), None));
+    test_data_streaming(ti);
 }
 
 #[test]
