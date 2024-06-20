@@ -116,7 +116,9 @@ impl TestInstance {
         let mut builder = builder.unwrap_or_else(|| ConfigBuilder::new());
         builder.env(move |s| env.env(s), move || iterenv.iter());
         builder.create_runtime_dir(false);
-        builder.verbosity(5);
+        if std::env::var_os("LAWN_TEST_VERBOSE").is_some() {
+            builder.verbosity(5);
+        }
         builder.stdout(Box::new(io::Cursor::new(Vec::new())));
         builder.stderr(Box::new(io::stdout()));
         builder.config_file(&config_file);
