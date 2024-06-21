@@ -1,0 +1,33 @@
+#!/usr/bin/env ruby
+
+require 'openssl'
+require 'optparse'
+
+if ARGV.length > 0
+  outputlen = ARGV[0].to_i
+else
+  outputlen = 65536
+end
+
+hash = OpenSSL::Digest.new('SHA384')
+
+while buf = $stdin.read(1024)
+  hash << buf
+end
+
+digest = hash.digest
+
+cipher = OpenSSL::Cipher.new 'aes-256-ctr'
+cipher.encrypt
+cipher.key = digest[0...32]
+cipher.iv = digest[32..]
+
+zeros = "\x00" * 1024
+
+written = 0
+while written < outputlen
+  last = [outputlen - written, zeros.length].min
+  output = cipher.update zeros
+  print output[0...last]
+  written += last
+end
