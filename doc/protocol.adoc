@@ -295,6 +295,7 @@ The following capabilities are known:
 | `channel`   | `9p`                 | 9P channels (including all variants of the protocol)
 | `channel`   | `clipboard`          | clipboard channels
 | `channel`   | `command`            | command channels
+| `channel`   | `sftp`               | SFTP channels (including all versions of the protocol)
 | `channel`   | any extension string | Reserved for custom extensions
 
 | `store`     | `credential`         | credential stores
@@ -455,6 +456,7 @@ The following channel types are known:
 |  `9p`                 | channels for the 9P2000, 9P2000.u, and 9P2000.L protocols
 |  `clipboard`          | channels for clipboard operations
 |  `command`            | channels for commands
+|  `sftp`               | channels for the SFTP protocol
 |  any extension string | Reserved for custom extensions
 
 |===
@@ -498,6 +500,23 @@ In order to crate a channel of this type, the `channel=9p` protocol must be impl
 The `kind` field contains `9p`.
 The `selectors` field should indicate the selectors 0 and 1.
 Selector 0 indicates a unidirectional tunnel from 9P client to 9P server and selector 1 indicates a unidirectional tunnel from 9P server to 9P client.
+
+The `kind-args` and `meta` fields are null or absent.
+
+The `args` field should contain a single argument, the name of the file system share to mount.
+The `env` field, if present, should contain the environment variables of the client.
+If the client only supports Unicode environment variables, they MUST be encoded as UTF-8 without a BOM (unless a BOM is part of the data).
+
+===== SFTP Channels
+
+An SFTP channel is used for sending messages using the SFTP file system protocol and its variants.
+The specific variant is negotiated using the SFTP protocol itself, but support for version 3 is RECOMMENDED, since this is the most commonly implemented variant.
+
+In order to crate a channel of this type, the `channel=sftp` protocol must be implemented by both sides.
+
+The `kind` field contains `sftp`.
+The `selectors` field should indicate the selectors 0 and 1.
+Selector 0 indicates a unidirectional tunnel from SFTP client to SFTP server and selector 1 indicates a unidirectional tunnel from SFTP server to SFTP client.
 
 The `kind-args` and `meta` fields are null or absent.
 
