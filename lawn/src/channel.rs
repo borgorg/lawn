@@ -13,7 +13,9 @@ use lawn_protocol::protocol;
 use lawn_protocol::protocol::{ChannelID, ClipboardChannelOperation, ErrorBody, ResponseCode};
 use lawn_sftp::backend::Backend as SFTPBackend;
 use lawn_sftp::server::Server as ServerSFTP;
+use std::cmp::{self, Eq, Ord, PartialEq, PartialOrd};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::os::raw::c_int;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
@@ -260,6 +262,91 @@ fn file_from_command<F: FromRawFd, T: IntoRawFd>(io: Option<T>) -> Option<Arc<sy
     })))
 }
 
+struct ChannelCommandQueue {
+    logger: Arc<Logger>,
+    waiter: sync::Notify,
+    offset: Locked<u64>,
+    abort: AtomicBool,
+}
+
+impl ChannelCommandQueue {
+    fn new(logger: Arc<Logger>, offset: Locked<u64>) -> Self {
+        let waiter = sync::Notify::new();
+        waiter.notify_one();
+        Self {
+            logger,
+            waiter,
+            offset,
+            abort: AtomicBool::new(false),
+        }
+    }
+
+    async fn process_request<
+        'a,
+        T,
+        U,
+        Fut: Future<Output = Result<T, protocol::Error>> + Send,
+        F: FnOnce(sync::MutexGuard<'a, u64>, U) -> Fut,
+    >(
+        &'a self,
+        id: ChannelID,
+        offset: u64,
+        data: U,
+        task: F,
+    ) -> Result<T, protocol::Error> {
+        loop {
+            trace!(
+                self.logger,
+                "channel {}: waiting on lock for offset {}",
+                id,
+                offset
+            );
+            self.waiter.notified().await;
+            trace!(
+                self.logger,
+                "channel {}: trying op for offset {}",
+                id,
+                offset
+            );
+            let soff = self.offset.lock().await;
+            match offset.cmp(&*soff) {
+                cmp::Ordering::Less => {
+                    trace!(
+                        self.logger,
+                        "channel {}: stale request at offset {} (current {})",
+                        id,
+                        offset,
+                        *soff
+                    );
+                    self.waiter.notify_one();
+                    return Err(ResponseCode::Conflict.into());
+                }
+                cmp::Ordering::Equal => {
+                    trace!(
+                        self.logger,
+                        "channel {}: running op at offset {}",
+                        id,
+                        offset
+                    );
+                    let res = task(soff, data).await;
+                    self.waiter.notify_one();
+                    return res;
+                }
+                cmp::Ordering::Greater => {
+                    trace!(
+                        self.logger,
+                        "channel {}: not yet ready at offset {} (current {})",
+                        id,
+                        offset,
+                        *soff
+                    );
+                }
+            }
+            self.waiter.notify_one();
+        }
+    }
+}
+
 pub trait Channel {
     fn id(&self) -> ChannelID;
     fn read(
@@ -304,6 +391,11 @@ pub struct ServerGenericCommandChannel {
     logger: Arc<Logger>,
     alive: AtomicBool,
     bytes: Arc<sync::RwLock<(LockedU64, LockedU64, LockedU64)>>,
+    queue: Arc<(
+        ChannelCommandQueue,
+        ChannelCommandQueue,
+        ChannelCommandQueue,
+    )>,
 }
 
 pub struct ServerCommandChannel {
@@ -343,6 +435,70 @@ impl ServerGenericCommandChannel {
         }
         -1
     }
+
+    async fn do_write(
+        logger: Arc<Logger>,
+        id: ChannelID,
+        io: Locked<PipeWrite>,
+        data: Bytes,
+        blocking: bool,
+        guard: sync::MutexGuard<'_, u64>,
+    ) -> Result<u64, protocol::Error> {
+        let mut guard = guard;
+        let mut g = io.lock().await;
+        let mut off = 0;
+        while !blocking || off < data.len() {
+            trace!(logger, "channel {}: write", id);
+            let res = g.write(&data[off..]).await;
+            trace!(logger, "channel {}: write: {:?}", id, res);
+            match res {
+                Ok(n) => {
+                    *guard += n as u64;
+                    off += n;
+                }
+                Err(e) => {
+                    if off == 0 {
+                        return Err(e.into());
+                    } else {
+                        return Ok(off as u64);
+                    }
+                }
+            }
+            if !blocking {
+                break;
+            }
+        }
+        Ok(off as u64)
+    }
+
+    async fn do_write_blocking(
+        logger: Arc<Logger>,
+        id: ChannelID,
+        queue: &ChannelCommandQueue,
+        io: Locked<PipeWrite>,
+        data: Bytes,
+        sync: Option<u64>,
+    ) -> Result<u64, protocol::Error> {
+        match sync {
+            Some(syncoff) => {
+                trace!(
+                    logger,
+                    "channel {}: write: entering queue at offset {}",
+                    id,
+                    syncoff
+                );
+                queue
+                    .process_request(id, syncoff, data, move |guard, data| {
+                        Self::do_write(logger, id, io, data, true, guard)
+                    })
+                    .await
+            }
+            None => {
+                let guard = queue.offset.lock().await;
+                Self::do_write(logger, id, io, data, true, guard).await
+            }
+        }
+    }
 }
 
 impl ServerCommandChannel {
@@ -366,19 +522,25 @@ impl ServerCommandChannel {
             file_from_command::<PipeRead, _>(cmd.stdout.take()),
             file_from_command::<PipeRead, _>(cmd.stderr.take()),
         );
+        let bytes = (
+            Arc::new(sync::Mutex::new(0)),
+            Arc::new(sync::Mutex::new(0)),
+            Arc::new(sync::Mutex::new(0)),
+        );
         Ok(ServerCommandChannel {
             ch: ServerGenericCommandChannel {
                 cmd: Mutex::new(cmd),
                 fds: Arc::new(sync::RwLock::new(fds)),
                 exit_status: Mutex::new(None),
                 id,
+                queue: Arc::new((
+                    ChannelCommandQueue::new(logger.clone(), bytes.0.clone()),
+                    ChannelCommandQueue::new(logger.clone(), bytes.1.clone()),
+                    ChannelCommandQueue::new(logger.clone(), bytes.2.clone()),
+                )),
+                bytes: Arc::new(sync::RwLock::new(bytes)),
                 logger,
                 alive: AtomicBool::new(true),
-                bytes: Arc::new(sync::RwLock::new((
-                    Arc::new(sync::Mutex::new(0)),
-                    Arc::new(sync::Mutex::new(0)),
-                    Arc::new(sync::Mutex::new(0)),
-                ))),
             },
         })
     }
@@ -501,12 +663,14 @@ impl Channel for ServerGenericCommandChannel {
         selector: u32,
         data: Bytes,
         sync: Option<u64>,
-        _blocking: Option<bool>,
+        blocking: Option<bool>,
     ) -> Result<u64, protocol::Error> {
         let fds = self.fds.clone();
         let bytes = self.bytes.clone();
+        let queue = self.queue.clone();
         let id = self.id;
         let logger = self.logger.clone();
+        let blocking = blocking == Some(true);
         block_on_async(async move {
             let io = {
                 let g = fds.read().await;
@@ -519,31 +683,23 @@ impl Channel for ServerGenericCommandChannel {
                     None => return Err(protocol::Error::from_errno(libc::EBADF)),
                 }
             };
-            let gbytes = bytes.read().await;
-            let bytes_written = {
-                match selector {
-                    0 => &gbytes.0,
+            if blocking {
+                let queue = match selector {
+                    0 => &queue.0,
                     _ => return Err(protocol::Error::from_errno(libc::EBADF)),
-                }
-                .clone()
-            };
-            if let Some(sync) = sync {
-                let bytes_written = bytes_written.lock().await;
-                if sync != *bytes_written {
-                    return Err(protocol::ResponseCode::Conflict.into());
-                }
-            }
-            let mut g = io.lock().await;
-            trace!(logger, "channel {}: write", id);
-            let res = g.write(&data).await;
-            trace!(logger, "channel {}: write: {:?}", id, res);
-            match res {
-                Ok(n) => {
-                    let mut bytes_written = bytes_written.lock().await;
-                    *bytes_written += n as u64;
-                    Ok(n as u64)
-                }
-                Err(e) => Err(e.into()),
+                };
+                Self::do_write_blocking(logger, id, queue, io, data, sync).await
+            } else {
+                let gbytes = bytes.read().await;
+                let bytes_written = {
+                    match selector {
+                        0 => &gbytes.0,
+                        _ => return Err(protocol::Error::from_errno(libc::EBADF)),
+                    }
+                    .clone()
+                };
+                let guard = bytes_written.lock().await;
+                Self::do_write(logger, id, io, data, false, guard).await
             }
         })
     }
@@ -685,19 +841,25 @@ impl ServerClipboardChannel {
             file_from_command::<PipeRead, _>(cmd.stdout.take()),
             None,
         );
+        let bytes = (
+            Arc::new(sync::Mutex::new(0)),
+            Arc::new(sync::Mutex::new(0)),
+            Arc::new(sync::Mutex::new(0)),
+        );
         Ok(ServerClipboardChannel {
             ch: ServerGenericCommandChannel {
                 cmd: Mutex::new(cmd),
                 fds: Arc::new(sync::RwLock::new(fds)),
                 exit_status: Mutex::new(None),
                 id,
+                queue: Arc::new((
+                    ChannelCommandQueue::new(logger.clone(), bytes.0.clone()),
+                    ChannelCommandQueue::new(logger.clone(), bytes.1.clone()),
+                    ChannelCommandQueue::new(logger.clone(), bytes.2.clone()),
+                )),
+                bytes: Arc::new(sync::RwLock::new(bytes)),
                 logger,
                 alive: AtomicBool::new(true),
-                bytes: Arc::new(sync::RwLock::new((
-                    Arc::new(sync::Mutex::new(0)),
-                    Arc::new(sync::Mutex::new(0)),
-                    Arc::new(sync::Mutex::new(0)),
-                ))),
             },
         })
     }
