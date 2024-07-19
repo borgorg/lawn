@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::encoding::{escape, path};
 use crate::error::{Error, ErrorKind};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use lawn_protocol::config::Logger;
 use lawn_protocol::handler;
 use lawn_protocol::handler::ProtocolHandler;
@@ -27,6 +27,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc::channel;
 use tokio::task::JoinHandle;
 
 pub struct Connection {
@@ -482,65 +483,180 @@ impl Connection {
         })
     }
 
-    async fn write_copy_command_fd<R: AsyncReadExt + Unpin>(
+    async fn write_copy_command_fd<R: AsyncReadExt + Unpin + Send + 'static>(
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
         r: R,
     ) -> Result<u64, Error> {
         let mut r = r;
-        let mut total = 0u64;
-        let mut buf = [0u8; 65536];
-        let mut off = 0;
-        let mut last = 0;
-        loop {
-            let (start, end) = if off == 0 {
-                let sz = match r.read(&mut buf).await {
-                    Ok(0) => {
-                        return Ok(total);
-                    }
-                    Ok(sz) => sz,
-                    Err(e) => return Err(handler::Error::from(protocol::Error::from(e)).into()),
-                };
-                (0, sz)
+        let (intx, mut inrx) = channel::<Result<Bytes, Error>>(20);
+        let (outtx, mut outrx) = channel(20);
+        let (msgtx, msgrx) = channel(20);
+        let (resptx, mut resprx) = channel(20);
+        let handler = self.handler.clone();
+        let config = self.config.clone();
+        let logger = self.config.logger();
+        let blocking = {
+            let capa = self.capabilities.read().await;
+            if capa.contains(&protocol::Capability::ChannelBlockingIO) {
+                Some(true)
             } else {
-                (off, last)
-            };
-            match self
-                .clone()
-                .write_channel(id, selector, &buf[start..end])
-                .await
-            {
-                Ok(written) if written as usize == end - start => {
-                    off = 0;
-                    last = 0;
-                    total += written;
-                }
-                Ok(written) => {
-                    off += written as usize;
-                    last = end;
-                    total += written;
-                }
-                Err(e) => match io::Error::try_from(e) {
-                    Ok(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        off = start;
-                        last = end;
-                        let mut selectors = BTreeMap::new();
-                        selectors.insert(1, PollChannelFlags::Output | PollChannelFlags::Hangup);
-                        let _ = Self::poll_channel(
-                            self.config.clone(),
-                            self.handler.clone(),
-                            id,
-                            &selectors,
-                        )
-                        .await;
-                        continue;
+                None
+            }
+        };
+        let msgproc = tokio::spawn(async move {
+            handler
+                .send_messages_from_channel::<WriteChannelRequest, WriteChannelResponse, Empty>(
+                    MessageKind::WriteChannel,
+                    msgrx,
+                    resptx,
+                )
+                .await;
+        });
+        let outtx2 = outtx.clone();
+        let sender = tokio::spawn(async move {
+            if blocking != Some(true) {
+                return;
+            }
+            while let Some(msg) = resprx.recv().await {
+                let resp = match msg {
+                    Ok(Some(ResponseValue::Success(resp))) => Ok(resp.count),
+                    Ok(Some(ResponseValue::Continuation(_))) => {
+                        Err(Error::new(ErrorKind::UnexpectedContinuation))
                     }
-                    Ok(e) => return Err(handler::Error::from(protocol::Error::from(e)).into()),
-                    Err(e) => return Err(e.0),
-                },
+                    Ok(None) => Err(Error::new(ErrorKind::MissingResponse)),
+                    Err(e) => Err(e.into()),
+                };
+                if outtx2.send(resp).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let writer = tokio::spawn(async move {
+            let mut total = 0u64;
+            while let Some(buf) = inrx.recv().await {
+                let buf = match buf {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        let _ = outtx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                if blocking == Some(true) {
+                    let req = WriteChannelRequest {
+                        id,
+                        selector,
+                        bytes: buf.clone(),
+                        stream_sync: Some(total),
+                        blocking,
+                    };
+                    trace!(
+                        logger,
+                        "blocking channel write: offset {}; {} bytes to write; new offset {}",
+                        total,
+                        buf.len(),
+                        total + (buf.len() as u64),
+                    );
+                    total += buf.len() as u64;
+                    if msgtx.send(req).await.is_err() {
+                        return;
+                    }
+                } else {
+                    let mut off = 0;
+                    while off < buf.len() {
+                        trace!(
+                            logger,
+                            "non-blocking channel write: offset {} of {} bytes",
+                            off,
+                            buf.len()
+                        );
+                        match self
+                            .clone()
+                            .write_channel(id, selector, buf.slice(off..))
+                            .await
+                        {
+                            Ok(written) => {
+                                off += written as usize;
+                                trace!(
+                                    logger,
+                                    "non-blocking channel write: wrote {} bytes; offset {}",
+                                    written,
+                                    off
+                                );
+                            }
+                            Err(e) => match io::Error::try_from(e) {
+                                Ok(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    let mut selectors = BTreeMap::new();
+                                    selectors.insert(
+                                        1,
+                                        PollChannelFlags::Output | PollChannelFlags::Hangup,
+                                    );
+                                    let _ = Self::poll_channel(
+                                        self.config.clone(),
+                                        self.handler.clone(),
+                                        id,
+                                        &selectors,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                Ok(e) => {
+                                    let _ = outtx
+                                        .send(Err(
+                                            handler::Error::from(protocol::Error::from(e)).into()
+                                        ))
+                                        .await;
+                                    return;
+                                }
+                                Err(e) => {
+                                    let _ = outtx.send(Err(e.0)).await;
+                                    return;
+                                }
+                            },
+                        }
+                    }
+                    if outtx.send(Ok(buf.len() as u64)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let reader = tokio::spawn(async move {
+            loop {
+                let mut buf = BytesMut::with_capacity(65536);
+                match r.read_buf(&mut buf).await {
+                    Ok(0) => return,
+                    Ok(sz) => sz,
+                    Err(e) => {
+                        let _ = intx
+                            .send(Err(handler::Error::from(protocol::Error::from(e)).into()))
+                            .await;
+                        return;
+                    }
+                };
+                let buf: Bytes = buf.into();
+                let _ = intx.send(Ok(buf)).await;
+            }
+        });
+        let logger = config.logger();
+        let mut total = 0u64;
+        while let Some(r) = outrx.recv().await {
+            match r {
+                Ok(n) => {
+                    trace!(logger, "channel write output ok: {} bytes", n);
+                    total += n;
+                }
+                Err(e) => {
+                    reader.abort();
+                    writer.abort();
+                    msgproc.abort();
+                    sender.abort();
+                    return Err(e);
+                }
             }
         }
+        Ok(total)
     }
 
     async fn read_copy_command_fd<W: AsyncWriteExt + Unpin>(
@@ -678,7 +794,7 @@ impl Connection {
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
-        data: &[u8],
+        data: Bytes,
     ) -> Result<u64, Error> {
         let blocking = {
             let capa = self.capabilities.read().await;
@@ -691,7 +807,7 @@ impl Connection {
         let req = WriteChannelRequest {
             id,
             selector,
-            bytes: data.to_vec().into(),
+            bytes: data,
             stream_sync: None,
             blocking,
         };
