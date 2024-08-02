@@ -137,6 +137,7 @@ impl<T: StoreElement> StoreElementEntry for T {
     }
 }
 
+#[allow(dead_code)]
 pub struct PlainStoreElementEntry {
     store_id: StoreID,
     path: Bytes,

@@ -326,6 +326,8 @@ impl CredentialDirectoryHandle {
         }
     }
 
+    // This is used in tests.
+    #[allow(dead_code)]
     async fn get_id(&self) -> Result<StoreSelectorID, CredentialError> {
         match self.id {
             Some(id) => Ok(id),
@@ -707,6 +709,7 @@ impl CredentialStore {
 }
 
 #[async_trait]
+#[allow(dead_code)]
 impl CredentialHandle for CredentialStore {
     async fn authenticate(
         &mut self,

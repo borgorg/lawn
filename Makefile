@@ -27,7 +27,7 @@ ASCIIDOCTOR ?= asciidoctor
 
 CARGO_DEB_VERSION = 1.28.0
 
-FREEBSD_VERSION ?= 13
+FREEBSD_VERSION ?= 14
 NETBSD_VERSION ?= 9
 
 MAN_SRC := $(wildcard doc/man/*.adoc)
