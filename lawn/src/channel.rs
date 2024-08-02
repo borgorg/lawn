@@ -252,6 +252,14 @@ fn poll(
     })
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+fn file_from_command<F: FromRawFd, T: IntoRawFd>(io: Option<T>) -> Option<Arc<sync::Mutex<F>>> {
+    let io = io?;
+    Some(Arc::new(sync::Mutex::new(unsafe {
+        F::from_raw_fd(io.into_raw_fd())
+    })))
+}
+
 pub trait Channel {
     fn id(&self) -> ChannelID;
     fn read(&self, selector: u32, count: u64) -> Result<Bytes, protocol::Error>;
@@ -333,21 +341,15 @@ impl ServerCommandChannel {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         trace!(logger, "channel {}: spawn {:?}", id, cmd);
-        let cmd = match cmd.spawn() {
+        let mut cmd = match cmd.spawn() {
             Ok(cmd) => cmd,
             Err(e) => return Err(e.into()),
         };
         trace!(logger, "channel {}: spawn ok: pid {}", id, cmd.id());
         let fds = (
-            Some(Arc::new(sync::Mutex::new(unsafe {
-                PipeWrite::from_raw_fd(cmd.stdin.as_ref().unwrap().as_raw_fd())
-            }))),
-            Some(Arc::new(sync::Mutex::new(unsafe {
-                PipeRead::from_raw_fd(cmd.stdout.as_ref().unwrap().as_raw_fd())
-            }))),
-            Some(Arc::new(sync::Mutex::new(unsafe {
-                PipeRead::from_raw_fd(cmd.stderr.as_ref().unwrap().as_raw_fd())
-            }))),
+            file_from_command::<PipeWrite, _>(cmd.stdin.take()),
+            file_from_command::<PipeRead, _>(cmd.stdout.take()),
+            file_from_command::<PipeRead, _>(cmd.stderr.take()),
         );
         Ok(ServerCommandChannel {
             ch: ServerGenericCommandChannel {
@@ -598,8 +600,8 @@ impl ServerClipboardChannel {
         };
         trace!(logger, "channel {}: spawn ok: pid {}", id, cmd.id());
         let fds = (
-            Self::file_from_command::<PipeWrite, _>(cmd.stdin.take()),
-            Self::file_from_command::<PipeRead, _>(cmd.stdout.take()),
+            file_from_command::<PipeWrite, _>(cmd.stdin.take()),
+            file_from_command::<PipeRead, _>(cmd.stdout.take()),
             None,
         );
         Ok(ServerClipboardChannel {
@@ -612,14 +614,6 @@ impl ServerClipboardChannel {
                 alive: AtomicBool::new(true),
             },
         })
-    }
-
-    #[allow(clippy::arc_with_non_send_sync)]
-    fn file_from_command<F: FromRawFd, T: IntoRawFd>(io: Option<T>) -> Option<Arc<sync::Mutex<F>>> {
-        let io = io?;
-        Some(Arc::new(sync::Mutex::new(unsafe {
-            F::from_raw_fd(io.into_raw_fd())
-        })))
     }
 }
 
