@@ -697,9 +697,7 @@ impl Proxy {
         }
         let datalen = (len - 1) as usize;
         v.clear();
-        if v.capacity() < datalen {
-            v.reserve(datalen - v.capacity());
-        }
+        v.reserve(datalen);
         {
             let slice = unsafe {
                 std::mem::transmute::<&mut [MaybeUninit<u8>], &mut [u8]>(
