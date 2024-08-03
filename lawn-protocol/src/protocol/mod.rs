@@ -568,6 +568,8 @@ pub struct ReadChannelRequest {
 #[serde(rename_all = "kebab-case")]
 pub struct ReadChannelResponse {
     pub bytes: Bytes,
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
@@ -586,6 +588,8 @@ pub struct WriteChannelRequest {
 #[serde(rename_all = "kebab-case")]
 pub struct WriteChannelResponse {
     pub count: u64,
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]

@@ -944,7 +944,10 @@ impl Server {
                     tokio::task::spawn_blocking(move || ch.read(selector, count, sync, blocking))
                         .await
                         .unwrap()?;
-                let resp = protocol::ReadChannelResponse { bytes: data };
+                let resp = protocol::ReadChannelResponse {
+                    bytes: data,
+                    offset: sync,
+                };
                 Ok((ResponseType::Success, serializer.serialize_body(&resp)))
             }
             Some(MessageKind::WriteChannel) => {
@@ -963,7 +966,10 @@ impl Server {
                     tokio::task::spawn_blocking(move || ch.write(selector, bytes, sync, blocking))
                         .await
                         .unwrap()?;
-                let resp = protocol::WriteChannelResponse { count: n };
+                let resp = protocol::WriteChannelResponse {
+                    count: n,
+                    offset: sync,
+                };
                 Ok((ResponseType::Success, serializer.serialize_body(&resp)))
             }
             Some(MessageKind::DeleteChannel) => {
