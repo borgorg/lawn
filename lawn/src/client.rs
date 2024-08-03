@@ -56,6 +56,10 @@ impl Connection {
         })
     }
 
+    pub(crate) fn handler(&self) -> Arc<ProtocolHandler<OwnedReadHalf, OwnedWriteHalf>> {
+        self.handler.clone()
+    }
+
     pub(crate) fn config(&self) -> Arc<Config> {
         self.config.clone()
     }
@@ -457,7 +461,7 @@ impl Connection {
         res.unwrap()
     }
 
-    fn io_channel_write_task<R: AsyncReadExt + Unpin + Send + 'static>(
+    pub(crate) fn io_channel_write_task<R: AsyncReadExt + Unpin + Send + 'static>(
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
@@ -470,7 +474,7 @@ impl Connection {
         })
     }
 
-    fn io_channel_read_task<W: AsyncWriteExt + Unpin + Send + 'static>(
+    pub(crate) fn io_channel_read_task<W: AsyncWriteExt + Unpin + Send + 'static>(
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
@@ -697,7 +701,7 @@ impl Connection {
         }
     }
 
-    fn handle_async_run_message(
+    pub(crate) fn handle_async_run_message(
         handler: &ProtocolHandler<OwnedReadHalf, OwnedWriteHalf>,
         msg: &protocol::Message,
     ) -> Option<i32> {
@@ -775,6 +779,7 @@ impl Connection {
             count: 65536,
             stream_sync: None,
             blocking,
+            complete: false,
         };
         let resp: ReadChannelResponse = match self
             .handler
@@ -825,7 +830,7 @@ impl Connection {
         Ok(resp.count)
     }
 
-    async fn detach_channel_selector(self: Arc<Self>, id: ChannelID, selector: u32) {
+    pub(crate) async fn detach_channel_selector(self: Arc<Self>, id: ChannelID, selector: u32) {
         let req = DetachChannelSelectorRequest { id, selector };
         let res = self
             .handler
@@ -840,7 +845,7 @@ impl Connection {
         );
     }
 
-    async fn create_command_channel(&self, args: &[Bytes]) -> Result<ChannelID, Error> {
+    pub(crate) async fn create_command_channel(&self, args: &[Bytes]) -> Result<ChannelID, Error> {
         let config = self.config.clone();
         let req = CreateChannelRequest {
             kind: (b"command" as &'static [u8]).into(),

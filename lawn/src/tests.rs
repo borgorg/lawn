@@ -1308,6 +1308,136 @@ fn can_stream_data_correctly_in_nonblocking_mode() {
     test_data_streaming(ti);
 }
 
+async fn spawn_recv_process(
+    c: Arc<client::Connection>,
+) -> tokio::sync::mpsc::Receiver<Result<i32, crate::error::Error>> {
+    let handler = c.clone().handler();
+
+    let (finaltx, finalrx) = tokio::sync::mpsc::channel(1);
+    let logger = c.config().logger();
+    tokio::spawn(async move {
+        loop {
+            let msg = handler.recv().await;
+            trace!(logger, "client: received packet");
+            if let Ok(Some(msg)) = msg {
+                trace!(logger, "client: received async response");
+                if let Some(code) =
+                    crate::client::Connection::handle_async_run_message(&handler, &msg)
+                {
+                    trace!(logger, "client: sending final message");
+                    finaltx.send(Ok(code)).await.unwrap();
+                    break;
+                }
+            }
+        }
+    });
+    finalrx
+}
+
+fn test_out_of_order_packets(ti: Arc<TestInstance>) {
+    with_server(ti.clone(), async move {
+        use lawn_protocol::protocol::{
+            Empty, MessageKind, WriteChannelRequest, WriteChannelResponse,
+        };
+        use sha2::Digest;
+        use sha2::Sha256;
+        use tokio::sync::mpsc::channel;
+
+        // Basic setup.
+        let c = ti.connection().await;
+        c.ping().await.unwrap();
+        let resp = c.negotiate_default_version().await.unwrap();
+        assert_eq!(resp.version, &[0], "version is correct");
+        assert_eq!(
+            resp.user_agent.unwrap(),
+            config::VERSION,
+            "user-agent is correct"
+        );
+        c.auth_external().await.unwrap();
+
+        const RANDOM_DATA_SIZE: usize = 1024 * 1024;
+        let mut buf = vec![0u8; RANDOM_DATA_SIZE];
+        {
+            use rand::Rng;
+
+            let prng = ti.config().prng();
+            let mut prng = prng.lock().unwrap();
+            prng.fill(buf.as_mut_slice());
+        }
+        let buf = Bytes::from(buf);
+        let digest = Sha256::digest(&buf);
+
+        let mut outpathbuf = ti.tempdir().to_owned();
+        outpathbuf.push("stdout");
+        let mut errpathbuf = ti.tempdir().to_owned();
+        errpathbuf.push("stderr");
+
+        let stdout = tokio::fs::File::create(&outpathbuf).await.unwrap();
+        let stderr = tokio::fs::File::create(&errpathbuf).await.unwrap();
+
+        let args: &[Bytes] = &[
+            Bytes::from(b"sha256sum".as_slice()),
+            Bytes::from(b"-b".as_slice()),
+        ];
+
+        let id = c.create_command_channel(args).await.unwrap();
+        let mut finalrx = spawn_recv_process(c.clone()).await;
+
+        let perm = [1usize, 2, 0, 3];
+        const CHUNK_SIZE: usize = 2048;
+        const NUM_CHUNKS: usize = RANDOM_DATA_SIZE / CHUNK_SIZE;
+        let (msgtx, msgrx) = channel(20);
+        let (resptx, mut resprx) = channel(20);
+        let handler = c.clone().handler();
+        let msgproc = tokio::spawn(async move {
+            handler
+                .send_messages_from_channel::<WriteChannelRequest, WriteChannelResponse, Empty>(
+                    MessageKind::WriteChannel,
+                    msgrx,
+                    resptx,
+                )
+                .await;
+        });
+        let unwrapper = tokio::spawn(async move { while resprx.recv().await.is_some() {} });
+        for i in 0..NUM_CHUNKS {
+            let offset = (i & 0xfffc) | perm[i & 3];
+            let chunk = buf.slice(offset * CHUNK_SIZE..(offset + 1) * CHUNK_SIZE);
+            let req = WriteChannelRequest {
+                id,
+                selector: 0,
+                bytes: chunk,
+                stream_sync: Some((offset * CHUNK_SIZE) as u64),
+                blocking: Some(true),
+            };
+            msgtx.send(req).await.unwrap();
+        }
+        std::mem::drop(msgtx);
+        msgproc.await.unwrap();
+        c.clone().detach_channel_selector(id, 0).await;
+        let stdout_task = c.clone().io_channel_read_task(id, 1, stdout);
+        let stderr_task = c.clone().io_channel_read_task(id, 2, stderr);
+        finalrx.recv().await.unwrap().unwrap();
+        let _ = tokio::join!(stdout_task, stderr_task, unwrapper);
+        let outbuf = tokio::fs::read(&outpathbuf).await.unwrap();
+        let errbuf = tokio::fs::read(&errpathbuf).await.unwrap();
+        let expected = format!("{} *-\n", hex::encode(digest));
+        assert_eq!(errbuf, b"", "no stderr");
+        assert_eq!(outbuf, expected.as_bytes(), "expected stdout");
+    });
+}
+
+#[test]
+fn can_send_out_of_order_packets_with_blocking_io() {
+    let mut capabilities = Capability::implemented();
+    capabilities.insert(Capability::ChannelBlockingIO);
+
+    let mut cb = ConfigBuilder::new();
+    cb.capabilities(capabilities);
+
+    let ti = Arc::new(TestInstance::new(Some(cb), None));
+    test_out_of_order_packets(ti);
+}
+
 #[test]
 fn can_read_template_contexts() {
     let mut capabilities = Capability::implemented();
