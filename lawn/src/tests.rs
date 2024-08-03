@@ -1334,6 +1334,25 @@ async fn spawn_recv_process(
     finalrx
 }
 
+#[allow(dead_code)]
+fn dump_prng_output<P: AsRef<Path> + Send + Sync + 'static>(ti: Arc<TestInstance>, destination: P) {
+    use tokio::io::AsyncWriteExt;
+
+    with_server(ti.clone(), async move {
+        const RANDOM_DATA_SIZE: usize = 1024 * 1024;
+        let mut buf = vec![0u8; RANDOM_DATA_SIZE];
+        {
+            use rand::Rng;
+
+            let prng = ti.config().prng();
+            let mut prng = prng.lock().unwrap();
+            prng.fill(buf.as_mut_slice());
+        }
+        let mut dest = tokio::fs::File::create(destination.as_ref()).await.unwrap();
+        dest.write_all(&buf).await.unwrap();
+    });
+}
+
 fn test_out_of_order_packets(ti: Arc<TestInstance>) {
     with_server(ti.clone(), async move {
         use lawn_protocol::protocol::{
