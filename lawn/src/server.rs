@@ -940,10 +940,12 @@ impl Server {
                 let count = m.count;
                 let sync = m.stream_sync;
                 let blocking = m.blocking;
-                let data =
-                    tokio::task::spawn_blocking(move || ch.read(selector, count, sync, blocking))
-                        .await
-                        .unwrap()?;
+                let complete = m.complete;
+                let data = tokio::task::spawn_blocking(move || {
+                    ch.read(selector, count, sync, blocking, complete)
+                })
+                .await
+                .unwrap()?;
                 let resp = protocol::ReadChannelResponse {
                     bytes: data,
                     offset: sync,

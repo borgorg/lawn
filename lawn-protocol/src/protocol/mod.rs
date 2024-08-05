@@ -562,6 +562,8 @@ pub struct ReadChannelRequest {
     pub stream_sync: Option<u64>,
     #[serde(default)]
     pub blocking: Option<bool>,
+    #[serde(default)]
+    pub complete: bool,
 }
 
 #[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]

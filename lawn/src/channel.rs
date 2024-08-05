@@ -355,6 +355,7 @@ pub trait Channel {
         count: u64,
         sync: Option<u64>,
         blocking: Option<bool>,
+        complete: bool,
     ) -> Result<Bytes, protocol::Error>;
     fn write(
         &self,
@@ -557,8 +558,9 @@ impl Channel for ServerCommandChannel {
         count: u64,
         sync: Option<u64>,
         blocking: Option<bool>,
+        complete: bool,
     ) -> Result<Bytes, protocol::Error> {
-        self.ch.read(selector, count, sync, blocking)
+        self.ch.read(selector, count, sync, blocking, complete)
     }
 
     fn write(
@@ -609,6 +611,7 @@ impl Channel for ServerGenericCommandChannel {
         count: u64,
         sync: Option<u64>,
         _blocking: Option<bool>,
+        complete: bool,
     ) -> Result<Bytes, protocol::Error> {
         let fds = self.fds.clone();
         let bytes = self.bytes.clone();
@@ -642,19 +645,39 @@ impl Channel for ServerGenericCommandChannel {
                     return Err(protocol::ResponseCode::Conflict.into());
                 }
             }
-            let mut v = vec![0u8; std::cmp::min(count, 4096) as usize];
-            let mut g = io.lock().await;
-            let res = g.read(&mut v).await;
-            trace!(logger, "channel {}: read: {:?}", id, res);
-            match res {
-                Ok(n) => {
-                    v.truncate(n);
-                    let mut bytes_read = bytes_read.lock().await;
-                    *bytes_read += n as u64;
-                    Ok(v.into())
-                }
-                Err(e) => Err(e.into()),
+            if count > 64 * 1024 {
+                return Err(protocol::ResponseCode::InvalidParameters.into());
             }
+            let mut v = vec![0u8; count as usize];
+            let mut off = 0;
+            let mut g = io.lock().await;
+            while off < v.len() {
+                let res = g.read(&mut v[off..]).await;
+                trace!(logger, "channel {}: read: {:?}", id, res);
+                match res {
+                    Ok(n) => {
+                        let mut bytes_read = bytes_read.lock().await;
+                        *bytes_read += n as u64;
+                        off += n;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if off == 0 {
+                            return Err(e.into());
+                        } else {
+                            v.truncate(off);
+                            return Ok(v.into());
+                        }
+                    }
+                }
+                if !complete {
+                    break;
+                }
+            }
+            v.truncate(off);
+            Ok(v.into())
         })
     }
 
@@ -876,8 +899,9 @@ impl Channel for ServerClipboardChannel {
         count: u64,
         sync: Option<u64>,
         blocking: Option<bool>,
+        complete: bool,
     ) -> Result<Bytes, protocol::Error> {
-        self.ch.read(selector, count, sync, blocking)
+        self.ch.read(selector, count, sync, blocking, complete)
     }
 
     fn write(
@@ -1192,6 +1216,7 @@ impl<T: FSChannel> Channel for T {
         count: u64,
         _sync: Option<u64>,
         blocking: Option<bool>,
+        complete: bool,
     ) -> Result<Bytes, protocol::Error> {
         let fd = self.rd();
         let logger = self.logger();
@@ -1229,22 +1254,43 @@ impl<T: FSChannel> Channel for T {
                 }
                 (1, Some(reader), Some(true)) => {
                     trace!(logger, "channel {}: reading {} (blocking)", id, selector);
-                    let mut buf = vec![0u8; std::cmp::min(count, 65536) as usize];
-                    let n = match reader.read(&mut buf).await {
-                        Ok(n) => n,
-                        Err(e) => {
-                            trace!(
-                                logger,
-                                "channel {}: reading {} failed with {}",
-                                id,
-                                selector,
-                                e
-                            );
-                            return Err(e.into());
+                    if count > 64 * 1024 {
+                        return Err(protocol::ResponseCode::InvalidParameters.into());
+                    }
+                    let mut buf = vec![0u8; count as usize];
+                    let mut off = 0;
+                    while off < buf.len() {
+                        let n = match reader.read(&mut buf).await {
+                            Ok(n) => n,
+                            Err(e) => {
+                                trace!(
+                                    logger,
+                                    "channel {}: reading {} failed with {}",
+                                    id,
+                                    selector,
+                                    e
+                                );
+                                if off == 0 {
+                                    return Err(e.into());
+                                } else {
+                                    buf.truncate(off);
+                                    return Ok(buf.into());
+                                }
+                            }
+                        };
+                        off += n;
+                        if !complete || n == 0 {
+                            break;
                         }
-                    };
-                    trace!(logger, "channel {}: read {} bytes from {}", id, n, selector);
-                    buf.truncate(n);
+                    }
+                    trace!(
+                        logger,
+                        "channel {}: read {} bytes from {}",
+                        id,
+                        off,
+                        selector
+                    );
+                    buf.truncate(off);
                     Ok(buf.into())
                 }
                 _ => {
