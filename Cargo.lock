@@ -360,6 +360,7 @@ dependencies = [
  "num-traits",
  "rand",
  "rand_chacha",
+ "rustix",
  "serde",
  "serde_cbor",
  "serde_json",

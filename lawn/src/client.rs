@@ -349,6 +349,7 @@ impl Connection {
         self: Arc<Self>,
         stdin: I,
         stdout: O,
+        stdout_isatty: bool,
         op: ClipboardChannelOperation,
         target: Option<ClipboardChannelTarget>,
     ) -> Result<i32, Error> {
@@ -366,8 +367,14 @@ impl Connection {
             .unwrap();
         let id = self.create_clipboard_channel(op, target).await?;
         match op {
-            ClipboardChannelOperation::Copy => self.run_channel(stdin, devnull, stderr, id).await,
-            ClipboardChannelOperation::Paste => self.run_channel(devnull, stdout, stderr, id).await,
+            ClipboardChannelOperation::Copy => {
+                self.run_channel(stdin, devnull, stderr, !stdout_isatty, id)
+                    .await
+            }
+            ClipboardChannelOperation::Paste => {
+                self.run_channel(devnull, stdout, stderr, !stdout_isatty, id)
+                    .await
+            }
         }
     }
 
@@ -387,7 +394,7 @@ impl Connection {
             .await
             .unwrap();
         let id = self.create_9p_channel(target).await?;
-        self.run_channel(stdin, stdout, devnull, id).await
+        self.run_channel(stdin, stdout, devnull, false, id).await
     }
 
     pub async fn run_sftp<
@@ -406,7 +413,7 @@ impl Connection {
             .await
             .unwrap();
         let id = self.create_sftp_channel(target).await?;
-        self.run_channel(stdin, stdout, devnull, id).await
+        self.run_channel(stdin, stdout, devnull, false, id).await
     }
 
     pub async fn run_command<
@@ -419,9 +426,11 @@ impl Connection {
         stdin: I,
         stdout: O,
         stderr: E,
+        stdout_isatty: bool,
     ) -> Result<i32, Error> {
         let id = self.create_command_channel(args).await?;
-        self.run_channel(stdin, stdout, stderr, id).await
+        self.run_channel(stdin, stdout, stderr, !stdout_isatty, id)
+            .await
     }
 
     async fn run_channel<
@@ -433,6 +442,7 @@ impl Connection {
         stdin: I,
         stdout: O,
         stderr: E,
+        complete: bool,
         id: ChannelID,
     ) -> Result<i32, Error> {
         let rhandler = self.handler.clone();
@@ -452,8 +462,8 @@ impl Connection {
             }
         });
         self.clone().io_channel_write_task(id, 0, stdin);
-        let stdout_task = self.clone().io_channel_read_task(id, 1, stdout);
-        let stderr_task = self.clone().io_channel_read_task(id, 2, stderr);
+        let stdout_task = self.clone().io_channel_read_task(id, 1, complete, stdout);
+        let stderr_task = self.clone().io_channel_read_task(id, 2, false, stderr);
         let res = finalrx.recv().await;
         let _ = tokio::join!(stdout_task, stderr_task);
         let _ = self.delete_channel(id).await;
@@ -478,10 +488,14 @@ impl Connection {
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
+        complete: bool,
         w: W,
     ) -> JoinHandle<Result<u64, Error>> {
         tokio::task::spawn(async move {
-            let r = self.clone().read_copy_command_fd(id, selector, w).await;
+            let r = self
+                .clone()
+                .read_copy_command_fd(id, selector, complete, w)
+                .await;
             self.detach_channel_selector(id, selector).await;
             r
         })
@@ -667,12 +681,13 @@ impl Connection {
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
+        complete: bool,
         w: W,
     ) -> Result<u64, Error> {
         let mut w = w;
         let mut total = 0u64;
         loop {
-            let data = match self.clone().read_channel(id, selector).await {
+            let data = match self.clone().read_channel(id, selector, complete).await {
                 Ok(data) if data.is_empty() => return Ok(total),
                 Ok(data) => data,
                 Err(e) => match io::Error::try_from(e) {
@@ -764,13 +779,18 @@ impl Connection {
         Ok(resp.selectors)
     }
 
-    async fn read_channel(self: Arc<Self>, id: ChannelID, selector: u32) -> Result<Bytes, Error> {
-        let blocking = {
+    async fn read_channel(
+        self: Arc<Self>,
+        id: ChannelID,
+        selector: u32,
+        complete: bool,
+    ) -> Result<Bytes, Error> {
+        let (blocking, complete) = {
             let capa = self.capabilities.read().await;
             if capa.contains(&protocol::Capability::ChannelBlockingIO) {
-                Some(true)
+                (Some(true), complete)
             } else {
-                None
+                (None, false)
             }
         };
         let req = ReadChannelRequest {
@@ -779,7 +799,7 @@ impl Connection {
             count: 65536,
             stream_sync: None,
             blocking,
-            complete: false,
+            complete,
         };
         let resp: ReadChannelResponse = match self
             .handler

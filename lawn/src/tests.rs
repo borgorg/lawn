@@ -1270,7 +1270,9 @@ fn test_data_streaming(ti: Arc<TestInstance>) {
         ];
 
         assert_eq!(
-            c.run_command(args, input, stdout, stderr).await.unwrap(),
+            c.run_command(args, input, stdout, stderr, false)
+                .await
+                .unwrap(),
             0,
             "exit status of command is 0"
         );
@@ -1433,8 +1435,8 @@ fn test_out_of_order_packets(ti: Arc<TestInstance>) {
         std::mem::drop(msgtx);
         msgproc.await.unwrap();
         c.clone().detach_channel_selector(id, 0).await;
-        let stdout_task = c.clone().io_channel_read_task(id, 1, stdout);
-        let stderr_task = c.clone().io_channel_read_task(id, 2, stderr);
+        let stdout_task = c.clone().io_channel_read_task(id, 1, true, stdout);
+        let stderr_task = c.clone().io_channel_read_task(id, 2, false, stderr);
         finalrx.recv().await.unwrap().unwrap();
         let _ = tokio::join!(stdout_task, stderr_task, unwrapper);
         let outbuf = tokio::fs::read(&outpathbuf).await.unwrap();
