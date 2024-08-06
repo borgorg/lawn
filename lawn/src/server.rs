@@ -941,6 +941,9 @@ impl Server {
                 let sync = m.stream_sync;
                 let blocking = m.blocking;
                 let complete = m.complete;
+                if sync.is_some() || blocking.is_some() || complete {
+                    assert_capability!(handler, protocol::Capability::ChannelBlockingIO);
+                }
                 let data = tokio::task::spawn_blocking(move || {
                     ch.read(selector, count, sync, blocking, complete)
                 })
@@ -964,6 +967,9 @@ impl Server {
                 let bytes = m.bytes;
                 let sync = m.stream_sync;
                 let blocking = m.blocking;
+                if sync.is_some() || blocking.is_some() {
+                    assert_capability!(handler, protocol::Capability::ChannelBlockingIO);
+                }
                 let n =
                     tokio::task::spawn_blocking(move || ch.write(selector, bytes, sync, blocking))
                         .await
