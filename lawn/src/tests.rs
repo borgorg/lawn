@@ -139,6 +139,9 @@ v0:
         echo:
             if: true
             command: '!f() { printf \"$@\"; };f'
+        randomgen:
+            if: true
+            command: '!f() { randomgen \"$@\"; };f'
         sha256sum:
             if: true
             command: '!f() { if command -v sha256sum >/dev/null 2>/dev/null; then sha256sum \"$@\"; else shasum -a 256 -b \"$@\"; fi; };f'
@@ -1358,7 +1361,8 @@ fn dump_prng_output<P: AsRef<Path> + Send + Sync + 'static>(ti: Arc<TestInstance
 fn test_out_of_order_packets(ti: Arc<TestInstance>) {
     with_server(ti.clone(), async move {
         use lawn_protocol::protocol::{
-            Empty, MessageKind, WriteChannelRequest, WriteChannelResponse,
+            Empty, MessageKind, ReadChannelRequest, ReadChannelResponse, WriteChannelRequest,
+            WriteChannelResponse,
         };
         use sha2::Digest;
         use sha2::Sha256;
@@ -1386,20 +1390,20 @@ fn test_out_of_order_packets(ti: Arc<TestInstance>) {
             prng.fill(buf.as_mut_slice());
         }
         let buf = Bytes::from(buf);
-        let digest = Sha256::digest(&buf);
 
         let mut outpathbuf = ti.tempdir().to_owned();
         outpathbuf.push("stdout");
         let mut errpathbuf = ti.tempdir().to_owned();
         errpathbuf.push("stderr");
 
-        let stdout = tokio::fs::File::create(&outpathbuf).await.unwrap();
         let stderr = tokio::fs::File::create(&errpathbuf).await.unwrap();
 
         let args: &[Bytes] = &[
-            Bytes::from(b"sha256sum".as_slice()),
-            Bytes::from(b"-b".as_slice()),
+            Bytes::from(b"randomgen".as_slice()),
+            Bytes::from(format!("{}", RANDOM_DATA_SIZE)),
         ];
+
+        let logger = c.config().logger();
 
         let id = c.create_command_channel(args).await.unwrap();
         let mut finalrx = spawn_recv_process(c.clone()).await;
@@ -1435,15 +1439,86 @@ fn test_out_of_order_packets(ti: Arc<TestInstance>) {
         std::mem::drop(msgtx);
         msgproc.await.unwrap();
         c.clone().detach_channel_selector(id, 0).await;
-        let stdout_task = c.clone().io_channel_read_task(id, 1, true, stdout);
+        unwrapper.await.unwrap();
+
+        let (msgtx, msgrx) = channel(20);
+        let (resptx, mut resprx) = channel(20);
+        let handler = c.clone().handler();
+        let msgproc = tokio::spawn(async move {
+            handler
+                .send_messages_from_channel::<ReadChannelRequest, ReadChannelResponse, Empty>(
+                    MessageKind::ReadChannel,
+                    msgrx,
+                    resptx,
+                )
+                .await;
+        });
+        for i in 0..NUM_CHUNKS {
+            let offset = (i & 0xfffc) | perm[i & 3];
+            let req = ReadChannelRequest {
+                id,
+                selector: 1,
+                count: CHUNK_SIZE as u64,
+                stream_sync: Some((offset * CHUNK_SIZE) as u64),
+                blocking: Some(true),
+                complete: true,
+            };
+            msgtx.send(req).await.unwrap();
+        }
+        // Read at the end, which will return EOF.
+        let req = ReadChannelRequest {
+            id,
+            selector: 1,
+            count: CHUNK_SIZE as u64,
+            stream_sync: Some((NUM_CHUNKS * CHUNK_SIZE) as u64),
+            blocking: Some(true),
+            complete: true,
+        };
+        msgtx.send(req).await.unwrap();
+        std::mem::drop(msgtx);
+        trace!(logger, "test: done sending read channel requests");
+        let bufwriter = tokio::spawn(async move {
+            let mut outbuf = vec![0u8; RANDOM_DATA_SIZE];
+            while let Some(resp) = resprx.recv().await {
+                trace!(logger, "test: received a response to read channel request");
+                let resp = resp.unwrap().unwrap();
+                let resp = match resp {
+                    protocol::ResponseValue::Success(r) => r,
+                    protocol::ResponseValue::Continuation(_) => panic!("unexpected continuation"),
+                };
+                let off = resp.offset.unwrap() as usize;
+                if resp.bytes.len() != 0 {
+                    outbuf[off..off + resp.bytes.len()].copy_from_slice(&resp.bytes);
+                }
+            }
+            trace!(logger, "test: no more responses");
+            outbuf
+        });
+        let logger = c.config().logger();
+        trace!(logger, "test: done sending read channel requests");
+        msgproc.await.unwrap();
+        trace!(logger, "test: done waiting for message sending task");
+
         let stderr_task = c.clone().io_channel_read_task(id, 2, false, stderr);
-        finalrx.recv().await.unwrap().unwrap();
-        let _ = tokio::join!(stdout_task, stderr_task, unwrapper);
-        let outbuf = tokio::fs::read(&outpathbuf).await.unwrap();
+        trace!(logger, "test: spawned stderr task");
+        let outbuf = bufwriter.await.unwrap();
+        trace!(logger, "test: done waiting for read body");
+        c.clone().detach_channel_selector(id, 1).await;
+        trace!(logger, "test: done detaching channel selector 1");
+        assert_eq!(finalrx.recv().await.unwrap().unwrap(), 0);
+        trace!(logger, "test: done waiting on receiver to exit");
+        let _ = stderr_task.await.unwrap();
+        trace!(logger, "test: done waiting on tasks to join");
+        let digest = Sha256::digest(&outbuf);
+        trace!(logger, "test: done computing digest");
         let errbuf = tokio::fs::read(&errpathbuf).await.unwrap();
         let expected = format!("{} *-\n", hex::encode(digest));
         assert_eq!(errbuf, b"", "no stderr");
-        assert_eq!(outbuf, expected.as_bytes(), "expected stdout");
+        assert_eq!(
+            expected.as_bytes(),
+            b"2361637e6d7170f46357a3714cfe290624d3af5580cdccd2a61c7c6282567004 *-\n",
+            "expected stdout"
+        );
     });
 }
 
