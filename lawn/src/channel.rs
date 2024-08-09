@@ -3,7 +3,7 @@
 use crate::config::Logger;
 use crate::task::block_on_async;
 use crate::unix;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use lawn_9p::backend::libc::LibcBackend;
 use lawn_9p::server::Server as Server9P;
 use lawn_constants::error::Error as Errno;
@@ -15,6 +15,7 @@ use lawn_sftp::backend::Backend as SFTPBackend;
 use lawn_sftp::server::Server as ServerSFTP;
 use std::cmp::{self, Eq, Ord, PartialEq, PartialOrd};
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::future::Future;
 use std::io;
 use std::os::raw::c_int;
@@ -472,6 +473,54 @@ impl ServerGenericCommandChannel {
         Ok(off as u64)
     }
 
+    async fn do_read(
+        logger: Arc<Logger>,
+        id: ChannelID,
+        io: Locked<PipeRead>,
+        count: u64,
+        blocking: bool,
+        complete: bool,
+        guard: sync::MutexGuard<'_, u64>,
+    ) -> Result<Bytes, protocol::Error> {
+        let mut guard = guard;
+        let mut g = io.lock().await;
+        let mut off = 0;
+        let count: usize = match count.try_into() {
+            Ok(c) => c,
+            Err(_) => return Err(protocol::ResponseCode::InvalidParameters.into()),
+        };
+        // It doesn't make sense to try to read a complete buffer if we're not blocking.
+        let complete = complete && blocking;
+        let mut buf = BytesMut::zeroed(count);
+        while !complete || off < buf.len() {
+            trace!(logger, "channel {}: read", id);
+            let res = g.read(&mut buf[off..]).await;
+            trace!(logger, "channel {}: read: {:?}", id, res);
+            match res {
+                Ok(n) => {
+                    *guard += n as u64;
+                    off += n;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if off == 0 {
+                        return Err(e.into());
+                    } else {
+                        buf.truncate(off);
+                        return Ok(buf.into());
+                    }
+                }
+            }
+            if !complete {
+                break;
+            }
+        }
+        buf.truncate(off);
+        Ok(buf.into())
+    }
+
     async fn do_write_blocking(
         logger: Arc<Logger>,
         id: ChannelID,
@@ -497,6 +546,36 @@ impl ServerGenericCommandChannel {
             None => {
                 let guard = queue.offset.lock().await;
                 Self::do_write(logger, id, io, data, true, guard).await
+            }
+        }
+    }
+
+    async fn do_read_blocking(
+        logger: Arc<Logger>,
+        id: ChannelID,
+        queue: &ChannelCommandQueue,
+        io: Locked<PipeRead>,
+        count: u64,
+        sync: Option<u64>,
+        complete: bool,
+    ) -> Result<Bytes, protocol::Error> {
+        match sync {
+            Some(syncoff) => {
+                trace!(
+                    logger,
+                    "channel {}: read: entering queue at offset {}",
+                    id,
+                    syncoff
+                );
+                queue
+                    .process_request(id, syncoff, count, move |guard, count| {
+                        Self::do_read(logger, id, io, count, true, complete, guard)
+                    })
+                    .await
+            }
+            None => {
+                let guard = queue.offset.lock().await;
+                Self::do_read(logger, id, io, count, true, complete, guard).await
             }
         }
     }
@@ -610,12 +689,13 @@ impl Channel for ServerGenericCommandChannel {
         selector: u32,
         count: u64,
         sync: Option<u64>,
-        _blocking: Option<bool>,
+        blocking: Option<bool>,
         complete: bool,
     ) -> Result<Bytes, protocol::Error> {
         let fds = self.fds.clone();
         let bytes = self.bytes.clone();
         let id = self.id;
+        let queue = self.queue.clone();
         let logger = self.logger.clone();
         block_on_async(async move {
             let io = {
@@ -630,54 +710,26 @@ impl Channel for ServerGenericCommandChannel {
                     None => return Err(protocol::Error::from_errno(libc::EBADF)),
                 }
             };
-            let gbytes = bytes.read().await;
-            let bytes_read = {
-                match selector {
-                    1 => &gbytes.1,
-                    2 => &gbytes.2,
+            if blocking == Some(true) {
+                let queue = match selector {
+                    1 => &queue.1,
+                    2 => &queue.2,
                     _ => return Err(protocol::Error::from_errno(libc::EBADF)),
-                }
-                .clone()
-            };
-            if let Some(sync) = sync {
-                let bytes_read = bytes_read.lock().await;
-                if sync != *bytes_read {
-                    return Err(protocol::ResponseCode::Conflict.into());
-                }
-            }
-            if count > 64 * 1024 {
-                return Err(protocol::ResponseCode::InvalidParameters.into());
-            }
-            let mut v = vec![0u8; count as usize];
-            let mut off = 0;
-            let mut g = io.lock().await;
-            while off < v.len() {
-                let res = g.read(&mut v[off..]).await;
-                trace!(logger, "channel {}: read: {:?}", id, res);
-                match res {
-                    Ok(n) => {
-                        let mut bytes_read = bytes_read.lock().await;
-                        *bytes_read += n as u64;
-                        off += n;
-                        if n == 0 {
-                            break;
-                        }
+                };
+                Self::do_read_blocking(logger, id, queue, io, count, sync, complete).await
+            } else {
+                let gbytes = bytes.read().await;
+                let bytes_written = {
+                    match selector {
+                        1 => &gbytes.1,
+                        2 => &gbytes.2,
+                        _ => return Err(protocol::Error::from_errno(libc::EBADF)),
                     }
-                    Err(e) => {
-                        if off == 0 {
-                            return Err(e.into());
-                        } else {
-                            v.truncate(off);
-                            return Ok(v.into());
-                        }
-                    }
-                }
-                if !complete {
-                    break;
-                }
+                    .clone()
+                };
+                let guard = bytes_written.lock().await;
+                Self::do_read(logger, id, io, count, false, false, guard).await
             }
-            v.truncate(off);
-            Ok(v.into())
         })
     }
 
