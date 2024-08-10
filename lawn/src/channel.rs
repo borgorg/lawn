@@ -263,7 +263,7 @@ fn file_from_command<F: FromRawFd, T: IntoRawFd>(io: Option<T>) -> Option<Arc<sy
     })))
 }
 
-struct ChannelCommandQueue {
+pub struct ChannelCommandQueue {
     logger: Arc<Logger>,
     waiter: sync::Notify,
     offset: Locked<u64>,
@@ -1077,6 +1077,8 @@ pub struct Server9PChannel {
     exit_status: Arc<Mutex<Option<i32>>>,
     id: ChannelID,
     logger: Arc<Logger>,
+    bytes: Arc<sync::RwLock<(Locked<u64>, Locked<u64>)>>,
+    queue: Arc<(ChannelCommandQueue, ChannelCommandQueue)>,
 }
 
 impl Server9PChannel {
@@ -1115,14 +1117,22 @@ impl Server9PChannel {
             let mut g = es.lock().unwrap();
             *g = Some(if r.is_ok() { 0 } else { 3 });
         });
+        let rd = Arc::new(sync::Mutex::new(Some(rd2)));
+        let wr = Arc::new(sync::Mutex::new(Some(wr2)));
+        let bytes = (Arc::new(sync::Mutex::new(0)), Arc::new(sync::Mutex::new(0)));
         Ok(Self {
-            logger,
+            logger: logger.clone(),
             id,
             rdwr,
             exit_status,
             alive: AtomicBool::new(true),
-            rd: Arc::new(sync::Mutex::new(Some(rd2))),
-            wr: Arc::new(sync::Mutex::new(Some(wr2))),
+            rd,
+            wr,
+            queue: Arc::new((
+                ChannelCommandQueue::new(logger.clone(), bytes.0.clone()),
+                ChannelCommandQueue::new(logger.clone(), bytes.1.clone()),
+            )),
+            bytes: Arc::new(sync::RwLock::new(bytes)),
         })
     }
 }
@@ -1134,6 +1144,18 @@ impl FSChannel for Server9PChannel {
 
     fn wr(&self) -> Arc<sync::Mutex<Option<OwnedWriteHalf>>> {
         self.wr.clone()
+    }
+
+    fn rd_bytes(&self) -> Locked<u64> {
+        self.bytes.blocking_read().1.clone()
+    }
+
+    fn wr_bytes(&self) -> Locked<u64> {
+        self.bytes.blocking_read().0.clone()
+    }
+
+    fn queue(&self) -> Arc<(ChannelCommandQueue, ChannelCommandQueue)> {
+        self.queue.clone()
     }
 
     fn fd(&self) -> RawFd {
@@ -1165,6 +1187,8 @@ pub struct ServerSFTPChannel {
     exit_status: Arc<Mutex<Option<i32>>>,
     id: ChannelID,
     logger: Arc<Logger>,
+    bytes: Arc<sync::RwLock<(Locked<u64>, Locked<u64>)>>,
+    queue: Arc<(ChannelCommandQueue, ChannelCommandQueue)>,
 }
 
 impl ServerSFTPChannel {
@@ -1205,14 +1229,22 @@ impl ServerSFTPChannel {
             let mut g = es.lock().unwrap();
             *g = Some(if r.is_ok() { 0 } else { 3 });
         });
+        let rd = Arc::new(sync::Mutex::new(Some(rd2)));
+        let wr = Arc::new(sync::Mutex::new(Some(wr2)));
+        let bytes = (Arc::new(sync::Mutex::new(0)), Arc::new(sync::Mutex::new(0)));
         Ok(Self {
-            logger,
+            logger: logger.clone(),
             id,
             rdwr,
             exit_status,
             alive: AtomicBool::new(true),
-            rd: Arc::new(sync::Mutex::new(Some(rd2))),
-            wr: Arc::new(sync::Mutex::new(Some(wr2))),
+            rd,
+            wr,
+            queue: Arc::new((
+                ChannelCommandQueue::new(logger.clone(), bytes.0.clone()),
+                ChannelCommandQueue::new(logger.clone(), bytes.1.clone()),
+            )),
+            bytes: Arc::new(sync::RwLock::new(bytes)),
         })
     }
 }
@@ -1224,6 +1256,18 @@ impl FSChannel for ServerSFTPChannel {
 
     fn wr(&self) -> Arc<sync::Mutex<Option<OwnedWriteHalf>>> {
         self.wr.clone()
+    }
+
+    fn rd_bytes(&self) -> Locked<u64> {
+        self.bytes.blocking_read().1.clone()
+    }
+
+    fn wr_bytes(&self) -> Locked<u64> {
+        self.bytes.blocking_read().0.clone()
+    }
+
+    fn queue(&self) -> Arc<(ChannelCommandQueue, ChannelCommandQueue)> {
+        self.queue.clone()
     }
 
     fn fd(&self) -> RawFd {
@@ -1255,6 +1299,128 @@ pub trait FSChannel {
     fn exit_status(&self) -> Arc<Mutex<Option<i32>>>;
     fn channel_id(&self) -> ChannelID;
     fn logger(&self) -> Arc<Logger>;
+    fn rd_bytes(&self) -> Locked<u64>;
+    fn wr_bytes(&self) -> Locked<u64>;
+    fn queue(&self) -> Arc<(ChannelCommandQueue, ChannelCommandQueue)>;
+}
+
+async fn fs_channel_do_read(
+    logger: Arc<Logger>,
+    id: ChannelID,
+    selector: u32,
+    reader: Arc<sync::Mutex<Option<OwnedReadHalf>>>,
+    count: u64,
+    complete: bool,
+    guard: sync::MutexGuard<'_, u64>,
+) -> Result<Bytes, protocol::Error> {
+    let mut guard = guard;
+    trace!(
+        logger,
+        "channel {}: reading {} (blocking) (complete {})",
+        id,
+        selector,
+        complete
+    );
+    if count > 64 * 1024 {
+        return Err(protocol::ResponseCode::InvalidParameters.into());
+    }
+    let mut buf = BytesMut::with_capacity(count as usize);
+    let mut off = 0;
+    let mut lock = reader.lock().await;
+    let reader = match &mut *lock {
+        Some(reader) => reader,
+        None => return Err(protocol::Error::from_errno(libc::EBADF)),
+    };
+    while off < buf.capacity() {
+        trace!(
+            logger,
+            "channel {}: reading {}: waiting for server to be readable",
+            id,
+            selector,
+        );
+        let n = match reader.read_buf(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                trace!(
+                    logger,
+                    "channel {}: reading {} failed with {}",
+                    id,
+                    selector,
+                    e
+                );
+                if off == 0 {
+                    return Err(e.into());
+                } else {
+                    *guard += off as u64;
+                    return Ok(buf.into());
+                }
+            }
+        };
+        off += n;
+        if !complete || n == 0 {
+            break;
+        }
+    }
+    trace!(
+        logger,
+        "channel {}: read {} bytes from {}",
+        id,
+        off,
+        selector
+    );
+    *guard += off as u64;
+    Ok(buf.into())
+}
+
+async fn fs_channel_do_write(
+    logger: Arc<Logger>,
+    id: ChannelID,
+    selector: u32,
+    writer: Arc<sync::Mutex<Option<OwnedWriteHalf>>>,
+    data: Bytes,
+    guard: sync::MutexGuard<'_, u64>,
+) -> Result<u64, protocol::Error> {
+    let mut guard = guard;
+    trace!(logger, "channel {}: writing {} (blocking)", id, selector);
+    let mut off = 0;
+    let mut lock = writer.lock().await;
+    let writer = match &mut *lock {
+        Some(writer) => writer,
+        None => return Err(protocol::Error::from_errno(libc::EBADF)),
+    };
+    while off < data.len() {
+        let n = match writer.write(&data[off..]).await {
+            Ok(n) => n,
+            Err(e) => {
+                trace!(
+                    logger,
+                    "channel {}: writing {} failed with {}",
+                    id,
+                    selector,
+                    e
+                );
+                if off == 0 {
+                    return Err(e.into());
+                } else {
+                    *guard += off as u64;
+                    return Ok(off as u64);
+                }
+            }
+        };
+        off += n;
+        if n == 0 {
+            break;
+        }
+    }
+    trace!(
+        logger,
+        "channel {}: wrote {} bytes to {}",
+        id,
+        off,
+        selector
+    );
+    *guard += off as u64;
+    Ok(off as u64)
 }
 
 impl<T: FSChannel> Channel for T {
@@ -1266,17 +1432,18 @@ impl<T: FSChannel> Channel for T {
         &self,
         selector: u32,
         count: u64,
-        _sync: Option<u64>,
+        sync: Option<u64>,
         blocking: Option<bool>,
         complete: bool,
     ) -> Result<Bytes, protocol::Error> {
-        let fd = self.rd();
+        let reader = self.rd();
         let logger = self.logger();
         let id = self.channel_id();
+        let rd_bytes = self.rd_bytes();
+        let queue = self.queue();
         block_on_async(async move {
-            let mut g = fd.lock().await;
-            match (selector, &mut *g, blocking) {
-                (1, Some(reader), Some(false)) | (1, Some(reader), None) => {
+            match (selector, blocking) {
+                (1, Some(false)) | (1, None) => {
                     trace!(
                         logger,
                         "channel {}: reading {} (non-blocking)",
@@ -1284,6 +1451,11 @@ impl<T: FSChannel> Channel for T {
                         selector
                     );
                     let mut buf = vec![0u8; std::cmp::min(count, 65536) as usize];
+                    let mut lock = reader.lock().await;
+                    let reader = match &mut *lock {
+                        Some(reader) => reader,
+                        None => return Err(protocol::Error::from_errno(libc::EBADF)),
+                    };
                     let n = match reader.try_read(&mut buf) {
                         Ok(n) => n,
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1302,48 +1474,55 @@ impl<T: FSChannel> Channel for T {
                     };
                     trace!(logger, "channel {}: read {} bytes from {}", id, n, selector);
                     buf.truncate(n);
+                    let mut gbytes = rd_bytes.lock().await;
+                    *gbytes += n as u64;
                     Ok(buf.into())
                 }
-                (1, Some(reader), Some(true)) => {
-                    trace!(logger, "channel {}: reading {} (blocking)", id, selector);
-                    if count > 64 * 1024 {
-                        return Err(protocol::ResponseCode::InvalidParameters.into());
-                    }
-                    let mut buf = vec![0u8; count as usize];
-                    let mut off = 0;
-                    while off < buf.len() {
-                        let n = match reader.read(&mut buf).await {
-                            Ok(n) => n,
-                            Err(e) => {
-                                trace!(
-                                    logger,
-                                    "channel {}: reading {} failed with {}",
-                                    id,
-                                    selector,
-                                    e
-                                );
-                                if off == 0 {
-                                    return Err(e.into());
-                                } else {
-                                    buf.truncate(off);
-                                    return Ok(buf.into());
-                                }
-                            }
-                        };
-                        off += n;
-                        if !complete || n == 0 {
-                            break;
-                        }
-                    }
+                (1, Some(true)) => {
                     trace!(
                         logger,
-                        "channel {}: read {} bytes from {}",
+                        "channel {}: reading {} (blocking) at offset {:?}",
                         id,
-                        off,
-                        selector
+                        selector,
+                        sync,
                     );
-                    buf.truncate(off);
-                    Ok(buf.into())
+                    let guard = rd_bytes.lock().await;
+                    match sync {
+                        Some(syncoff) => {
+                            trace!(
+                                logger,
+                                "channel {}: read: entering queue at offset {}",
+                                id,
+                                syncoff
+                            );
+                            let queue = &queue.1;
+                            queue
+                                .process_request(id, syncoff, count, move |guard, count| {
+                                    fs_channel_do_read(
+                                        logger.clone(),
+                                        id,
+                                        selector,
+                                        reader,
+                                        count,
+                                        complete,
+                                        guard,
+                                    )
+                                })
+                                .await
+                        }
+                        None => {
+                            fs_channel_do_read(
+                                logger.clone(),
+                                id,
+                                selector,
+                                reader,
+                                count,
+                                complete,
+                                guard,
+                            )
+                            .await
+                        }
+                    }
                 }
                 _ => {
                     trace!(
@@ -1362,16 +1541,22 @@ impl<T: FSChannel> Channel for T {
         &self,
         selector: u32,
         data: Bytes,
-        _sync: Option<u64>,
+        sync: Option<u64>,
         blocking: Option<bool>,
     ) -> Result<u64, protocol::Error> {
-        let fd = self.wr();
+        let writer = self.wr();
         let logger = self.logger();
         let id = self.channel_id();
+        let wr_bytes = self.wr_bytes();
+        let queue = self.queue();
         block_on_async(async move {
-            let mut g = fd.lock().await;
-            match (selector, &mut *g, blocking) {
-                (0, Some(writer), Some(false)) | (0, Some(writer), None) => {
+            match (selector, blocking) {
+                (0, Some(false)) | (0, None) => {
+                    let mut lock = writer.lock().await;
+                    let writer = match &mut *lock {
+                        Some(writer) => writer,
+                        None => return Err(protocol::Error::from_errno(libc::EBADF)),
+                    };
                     trace!(
                         logger,
                         "channel {}: writing {} (non-blocking)",
@@ -1403,30 +1588,33 @@ impl<T: FSChannel> Channel for T {
                     );
                     Ok(n as u64)
                 }
-                (0, Some(writer), Some(true)) => {
-                    trace!(logger, "channel {}: writing {} (blocking)", id, selector);
-                    let n = match writer.write(&data).await {
-                        Ok(n) => n,
-                        Err(e) => {
-                            trace!(
-                                logger,
-                                "channel {}: writing {} failed with {}",
-                                id,
-                                selector,
-                                e
-                            );
-                            return Err(e.into());
-                        }
-                    };
-                    trace!(
-                        logger,
-                        "channel {}: wrote {} bytes from {}",
-                        id,
-                        data.len(),
-                        selector
-                    );
-                    Ok(n as u64)
-                }
+                (0, Some(true)) => match sync {
+                    Some(syncoff) => {
+                        trace!(
+                            logger,
+                            "channel {}: write: entering queue at offset {}",
+                            id,
+                            syncoff
+                        );
+                        let queue = &queue.0;
+                        queue
+                            .process_request(id, syncoff, data, move |guard, data| {
+                                fs_channel_do_write(
+                                    logger.clone(),
+                                    id,
+                                    selector,
+                                    writer,
+                                    data,
+                                    guard,
+                                )
+                            })
+                            .await
+                    }
+                    None => {
+                        let guard = wr_bytes.lock().await;
+                        fs_channel_do_write(logger.clone(), id, selector, writer, data, guard).await
+                    }
+                },
                 _ => {
                     trace!(
                         logger,
