@@ -323,6 +323,7 @@ pub enum Capability {
     Channel9P,
     ChannelSFTP,
     ChannelClipboard,
+    ChannelBlockingIO,
     ExtensionAllocate,
     StoreCredential,
     ContextTemplate,
@@ -340,6 +341,7 @@ impl Capability {
             Self::ChannelClipboard,
             Self::Channel9P,
             Self::ChannelSFTP,
+            Self::ChannelBlockingIO,
             Self::ExtensionAllocate,
             Self::StoreCredential,
             Self::ContextTemplate,
@@ -359,6 +361,7 @@ impl Capability {
                 | Self::ChannelClipboard
                 | Self::Channel9P
                 | Self::ChannelSFTP
+                | Self::ChannelBlockingIO
                 | Self::ExtensionAllocate
                 | Self::StoreCredential
                 | Self::ContextTemplate
@@ -391,6 +394,10 @@ impl From<Capability> for (Bytes, Option<Bytes>) {
                 (b"channel" as &[u8]).into(),
                 Some((b"clipboard" as &[u8]).into()),
             ),
+            Capability::ChannelBlockingIO => (
+                (b"channel" as &[u8]).into(),
+                Some((b"blocking-io" as &[u8]).into()),
+            ),
             Capability::StoreCredential => (
                 (b"store" as &[u8]).into(),
                 Some((b"credential" as &[u8]).into()),
@@ -418,6 +425,7 @@ impl From<(&[u8], Option<&[u8]>)> for Capability {
             (b"channel", Some(b"9p")) => Capability::Channel9P,
             (b"channel", Some(b"sftp")) => Capability::ChannelSFTP,
             (b"channel", Some(b"clipboard")) => Capability::ChannelClipboard,
+            (b"channel", Some(b"blocking-io")) => Capability::ChannelBlockingIO,
             (b"store", Some(b"credential")) => Capability::StoreCredential,
             (b"extension", Some(b"allocate")) => Capability::ExtensionAllocate,
             (b"context", Some(b"template")) => Capability::ContextTemplate,
@@ -544,32 +552,46 @@ pub struct DeleteChannelRequest {
     pub termination: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Serialize, Deserialize, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct ReadChannelRequest {
     pub id: ChannelID,
     pub selector: u32,
     pub count: u64,
+    #[serde(default)]
+    pub stream_sync: Option<u64>,
+    #[serde(default)]
+    pub blocking: Option<bool>,
+    #[serde(default)]
+    pub complete: bool,
 }
 
-#[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Serialize, Deserialize, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct ReadChannelResponse {
     pub bytes: Bytes,
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Serialize, Deserialize, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct WriteChannelRequest {
     pub id: ChannelID,
     pub selector: u32,
     pub bytes: Bytes,
+    #[serde(default)]
+    pub stream_sync: Option<u64>,
+    #[serde(default)]
+    pub blocking: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Serialize, Deserialize, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct WriteChannelResponse {
     pub count: u64,
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
@@ -1582,5 +1604,79 @@ mod tests {
             },
             b"\xa3\x69extension\x82\x58\x23foobar@test.ns.crustytoothpaste.net\xf6\x58\x26extension@test.ns.crustytoothpaste.net\xf5\x65count\x05",
         );
+    }
+
+    #[test]
+    fn deserialize_requests_rw_compatible() {
+        #[derive(Serialize, Deserialize, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+        #[serde(rename_all = "kebab-case")]
+        struct ReadChannelLegacyRequest {
+            pub id: ChannelID,
+            pub selector: u32,
+            pub count: u64,
+        }
+
+        let cases: &[(&[u8], &str)] = &[
+            (b"\xa3\x62id\x00\x68selector\x02\x65count\x1a\xfe\xdc\xba\x98", "legacy"),
+            (b"\xa6\x62id\x00\x68selector\x02\x65count\x1a\xfe\xdc\xba\x98\x6bstream-sync\xf6\x68blocking\xf6\x68complete\xf4", "modern"),
+        ];
+        for (b, desc) in cases {
+            assert_decode(
+                &format!("ReadChannelRequest without blocking I/O: {}", desc),
+                &super::ReadChannelRequest {
+                    id: ChannelID(0),
+                    selector: 2,
+                    count: 0xfedcba98,
+                    stream_sync: None,
+                    blocking: None,
+                    complete: false,
+                },
+                b,
+            );
+            assert_decode(
+                &format!("ReadChannelRequest (legacy): {}", desc),
+                &ReadChannelLegacyRequest {
+                    id: ChannelID(0),
+                    selector: 2,
+                    count: 0xfedcba98,
+                },
+                b,
+            );
+        }
+
+        #[derive(Serialize, Deserialize, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+        #[serde(rename_all = "kebab-case")]
+        struct WriteChannelLegacyRequest {
+            pub id: ChannelID,
+            pub selector: u32,
+            pub bytes: Bytes,
+        }
+
+        let cases: &[(&[u8], &str)] = &[
+            (b"\xa3\x62id\x00\x68selector\x02\x65bytes\x44\xff\xfe\xc2\xa9", "legacy"),
+            (b"\xa5\x62id\x00\x68selector\x02\x65bytes\x44\xff\xfe\xc2\xa9\x6bstream-sync\xf6\x68blocking\xf6", "modern"),
+        ];
+        for (b, desc) in cases {
+            assert_decode(
+                &format!("WriteChannelRequest without blocking I/O: {}", desc),
+                &super::WriteChannelRequest {
+                    id: ChannelID(0),
+                    selector: 2,
+                    bytes: vec![0xffu8, 0xfe, 0xc2, 0xa9].into(),
+                    stream_sync: None,
+                    blocking: None,
+                },
+                b,
+            );
+            assert_decode(
+                &format!("WriteChannelRequest (legacy): {}", desc),
+                &WriteChannelLegacyRequest {
+                    id: ChannelID(0),
+                    selector: 2,
+                    bytes: vec![0xffu8, 0xfe, 0xc2, 0xa9].into(),
+                },
+                b,
+            );
+        }
     }
 }

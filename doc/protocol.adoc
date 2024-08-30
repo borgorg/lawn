@@ -295,6 +295,8 @@ The following capabilities are known:
 | `channel`   | `9p`                 | 9P channels (including all variants of the protocol)
 | `channel`   | `clipboard`          | clipboard channels
 | `channel`   | `command`            | command channels
+| `channel`   | `sftp`               | SFTP channels (including all versions of the protocol)
+| `channel`   | `blocking-io`        | blocking I/O support for channels
 | `channel`   | any extension string | Reserved for custom extensions
 
 | `store`     | `credential`         | credential stores
@@ -455,6 +457,7 @@ The following channel types are known:
 |  `9p`                 | channels for the 9P2000, 9P2000.u, and 9P2000.L protocols
 |  `clipboard`          | channels for clipboard operations
 |  `command`            | channels for commands
+|  `sftp`               | channels for the SFTP protocol
 |  any extension string | Reserved for custom extensions
 
 |===
@@ -498,6 +501,23 @@ In order to crate a channel of this type, the `channel=9p` protocol must be impl
 The `kind` field contains `9p`.
 The `selectors` field should indicate the selectors 0 and 1.
 Selector 0 indicates a unidirectional tunnel from 9P client to 9P server and selector 1 indicates a unidirectional tunnel from 9P server to 9P client.
+
+The `kind-args` and `meta` fields are null or absent.
+
+The `args` field should contain a single argument, the name of the file system share to mount.
+The `env` field, if present, should contain the environment variables of the client.
+If the client only supports Unicode environment variables, they MUST be encoded as UTF-8 without a BOM (unless a BOM is part of the data).
+
+===== SFTP Channels
+
+An SFTP channel is used for sending messages using the SFTP file system protocol and its variants.
+The specific variant is negotiated using the SFTP protocol itself, but support for version 3 is RECOMMENDED, since this is the most commonly implemented variant.
+
+In order to crate a channel of this type, the `channel=sftp` protocol must be implemented by both sides.
+
+The `kind` field contains `sftp`.
+The `selectors` field should indicate the selectors 0 and 1.
+Selector 0 indicates a unidirectional tunnel from SFTP client to SFTP server and selector 1 indicates a unidirectional tunnel from SFTP server to SFTP client.
 
 The `kind-args` and `meta` fields are null or absent.
 
@@ -570,6 +590,9 @@ A read channel request looks like this:
   id: u32,
   selector: u32,
   count: u64,
+  blocking: Option<bool>,
+  stream_sync: Option<u64>,
+  complete: bool,
 }
 ----
 
@@ -577,19 +600,33 @@ The `id` field is the channel ID and the `selector` field is an attached server-
 The `count` field indicates the number of bytes to read.
 Note that this must result in a response that is below the maximum message size.
 
+If both sides implement the `channel=blocking-io` capability, the `blocking` value may be set to `true` to indicate that the I/O is blocking; if it is `null`, the behavior is left to the server to decide, and if it is `false`, non-blocking I/O is requested.
+
+If blocking I/O is explicitly enabled, the `stream_sync` field, which is optional, indicates the starting stream offset on the sending side for this read.
+The request will block until that exact stream offset has been reached.
+If the server detects that the offset has passed, it will send a Conflict response.
+This field is necessary to ensure that multiple in-flight read requests are serviced properly.
+
+If blocking I/O is enabled, the `complete` field, which defaults to false, indicates that the read should not return until the full number of requested bytes has been read, an error occurs, or the stream is at end of file.
+If blocking I/O is enabled and `complete` is false, then a read will complete once _some_ amount of data has been read, an error occurs, or the stream is at end of file.
+Usually this will be whatever data is available to read at the moment.
+
 On success, a response looks like this:
 
 ----
 {
   bytes: Bytes,
+  offset: Option<u64>,
 }
 ----
 
 The `bytes` field contains the bytes read, which may be shorter than desired.
 If the field contains no data, then this means that end-of-file has been reached.
 
-Note that the read is non-blocking.
-If end-of-file has not been reached but there is no data to immediately read, the Errno response will be sent with an error code indicating EAGAIN.
+The `offset` field, which is only available if `stream_sync` is set (and thus, only available with blocking I/O), contains the value of `stream_sync`, which can be used to associate responses efficiently with their requests.
+This will always be the starting offset of the read.
+
+If end-of-file has not been reached but there is no data to immediately read and blocking I/O is not enabled, the Errno response will be sent with an error code indicating EAGAIN.
 Other errors may be indicated, either with an Errno response or otherwise.
 
 This message requires authentication.
@@ -605,22 +642,39 @@ A write channel request looks like this:
   id: u32,
   selector: u32,
   bytes: Bytes,
+  blocking: Option<bool>,
+  stream_sync: Option<u64>,
 }
 ----
 
 The `id` field is the channel ID and the `selector` field is an attached client-to-server selector on that channel.
 `bytes` is the data to write.
 
+If both sides implement the `channel=blocking-io` capability, the `blocking` value may be set to `true` to indicate that the I/O is blocking; if it is `null`, the behavior is left to the server to decide, and if it is `false`, non-blocking I/O is requested.
+
+If blocking I/O is explicitly enabled, the `stream_sync` field, which is optional, indicates the starting stream offset on the sending side for this write.
+The request will block until that exact stream offset has been reached.
+If the server detects that the offset has passed, it will send a Conflict response.
+This field is necessary to ensure that multiple in-flight write requests are serviced properly.
+
+If blocking I/O is enabled, a write will return when the entire payload has been written or an error occurs.
+
 On success, the response looks like this:
 
 ----
 {
   count: u64,
+  offset: Option<u64>,
 }
 ----
 
-Note that the write is non-blocking, and short writes may occur.
-If the data cannot be immediately written, the Errno response will be sent with an error code indicating EAGAIN.
+The `count` field indicates the number of bytes written.
+
+The `offset` field, which is only available if `stream_sync` is set (and thus, only available with blocking I/O), contains the value of `stream_sync`, which can be used to associate responses efficiently with their requests.
+This will always be the starting offset of the write.
+
+Note that short writes may occur.
+If blocking I/O is not enabled and the data cannot be immediately written, the Errno response will be sent with an error code indicating EAGAIN.
 Other errors may be indicated, either with an Errno response or otherwise.
 
 This message requires authentication.

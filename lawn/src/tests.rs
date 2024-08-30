@@ -116,7 +116,9 @@ impl TestInstance {
         let mut builder = builder.unwrap_or_else(|| ConfigBuilder::new());
         builder.env(move |s| env.env(s), move || iterenv.iter());
         builder.create_runtime_dir(false);
-        builder.verbosity(5);
+        if std::env::var_os("LAWN_TEST_VERBOSE").is_some() {
+            builder.verbosity(5);
+        }
         builder.stdout(Box::new(io::Cursor::new(Vec::new())));
         builder.stderr(Box::new(io::stdout()));
         builder.config_file(&config_file);
@@ -137,6 +139,12 @@ v0:
         echo:
             if: true
             command: '!f() { printf \"$@\"; };f'
+        randomgen:
+            if: true
+            command: '!f() { randomgen \"$@\"; };f'
+        sha256sum:
+            if: true
+            command: '!f() { if command -v sha256sum >/dev/null 2>/dev/null; then sha256sum \"$@\"; else shasum -a 256 -b \"$@\"; fi; };f'
 "
     }
 
@@ -1226,6 +1234,304 @@ fn rejects_store_auth_with_disallowed_types() {
             );
         });
     }
+}
+
+fn test_data_streaming(ti: Arc<TestInstance>) {
+    with_server(ti.clone(), async move {
+        // Basic setup.
+        let c = ti.connection().await;
+        c.ping().await.unwrap();
+        let resp = c.negotiate_default_version().await.unwrap();
+        assert_eq!(resp.version, &[0], "version is correct");
+        assert_eq!(
+            resp.user_agent.unwrap(),
+            config::VERSION,
+            "user-agent is correct"
+        );
+        c.auth_external().await.unwrap();
+
+        let mut buf = vec![0u8; 1024 * 1024];
+        {
+            use rand::Rng;
+
+            let prng = ti.config().prng();
+            let mut prng = prng.lock().unwrap();
+            prng.fill(buf.as_mut_slice());
+        }
+        let input = std::io::Cursor::new(buf);
+        let mut outpathbuf = ti.tempdir().to_owned();
+        outpathbuf.push("stdout");
+        let mut errpathbuf = ti.tempdir().to_owned();
+        errpathbuf.push("stderr");
+
+        let stdout = tokio::fs::File::create(&outpathbuf).await.unwrap();
+        let stderr = tokio::fs::File::create(&errpathbuf).await.unwrap();
+
+        let args: &[Bytes] = &[
+            Bytes::from(b"sha256sum".as_slice()),
+            Bytes::from(b"-b".as_slice()),
+        ];
+
+        assert_eq!(
+            c.run_command(args, input, stdout, stderr, false)
+                .await
+                .unwrap(),
+            0,
+            "exit status of command is 0"
+        );
+        let outbuf = tokio::fs::read(&outpathbuf).await.unwrap();
+        let errbuf = tokio::fs::read(&errpathbuf).await.unwrap();
+        assert_eq!(errbuf, b"", "no stderr");
+        assert_eq!(
+            outbuf, b"03092c09661027f16e879005cf9f460dd4e6ae32c12f32795d1715fee281030f *-\n",
+            "expected stdout"
+        );
+    });
+}
+
+#[test]
+fn can_stream_data_correctly_in_blocking_mode() {
+    let mut capabilities = Capability::implemented();
+    capabilities.insert(Capability::ChannelBlockingIO);
+
+    let mut cb = ConfigBuilder::new();
+    cb.capabilities(capabilities);
+
+    let ti = Arc::new(TestInstance::new(Some(cb), None));
+    test_data_streaming(ti);
+}
+
+#[test]
+fn can_stream_data_correctly_in_nonblocking_mode() {
+    let mut capabilities = Capability::implemented();
+    capabilities.remove(&Capability::ChannelBlockingIO);
+
+    let mut cb = ConfigBuilder::new();
+    cb.capabilities(capabilities);
+
+    let ti = Arc::new(TestInstance::new(Some(cb), None));
+    test_data_streaming(ti);
+}
+
+async fn spawn_recv_process(
+    c: Arc<client::Connection>,
+) -> tokio::sync::mpsc::Receiver<Result<i32, crate::error::Error>> {
+    let handler = c.clone().handler();
+
+    let (finaltx, finalrx) = tokio::sync::mpsc::channel(1);
+    let logger = c.config().logger();
+    tokio::spawn(async move {
+        loop {
+            let msg = handler.recv().await;
+            trace!(logger, "client: received packet");
+            if let Ok(Some(msg)) = msg {
+                trace!(logger, "client: received async response");
+                if let Some(code) =
+                    crate::client::Connection::handle_async_run_message(&handler, &msg)
+                {
+                    trace!(logger, "client: sending final message");
+                    finaltx.send(Ok(code)).await.unwrap();
+                    break;
+                }
+            }
+        }
+    });
+    finalrx
+}
+
+#[allow(dead_code)]
+fn dump_prng_output<P: AsRef<Path> + Send + Sync + 'static>(ti: Arc<TestInstance>, destination: P) {
+    use tokio::io::AsyncWriteExt;
+
+    with_server(ti.clone(), async move {
+        const RANDOM_DATA_SIZE: usize = 1024 * 1024;
+        let mut buf = vec![0u8; RANDOM_DATA_SIZE];
+        {
+            use rand::Rng;
+
+            let prng = ti.config().prng();
+            let mut prng = prng.lock().unwrap();
+            prng.fill(buf.as_mut_slice());
+        }
+        let mut dest = tokio::fs::File::create(destination.as_ref()).await.unwrap();
+        dest.write_all(&buf).await.unwrap();
+    });
+}
+
+fn test_out_of_order_packets(ti: Arc<TestInstance>) {
+    with_server(ti.clone(), async move {
+        use lawn_protocol::protocol::{
+            Empty, MessageKind, ReadChannelRequest, ReadChannelResponse, WriteChannelRequest,
+            WriteChannelResponse,
+        };
+        use sha2::Digest;
+        use sha2::Sha256;
+        use tokio::sync::mpsc::channel;
+
+        // Basic setup.
+        let c = ti.connection().await;
+        c.ping().await.unwrap();
+        let resp = c.negotiate_default_version().await.unwrap();
+        assert_eq!(resp.version, &[0], "version is correct");
+        assert_eq!(
+            resp.user_agent.unwrap(),
+            config::VERSION,
+            "user-agent is correct"
+        );
+        c.auth_external().await.unwrap();
+
+        const RANDOM_DATA_SIZE: usize = 1024 * 1024;
+        let mut buf = vec![0u8; RANDOM_DATA_SIZE];
+        {
+            use rand::Rng;
+
+            let prng = ti.config().prng();
+            let mut prng = prng.lock().unwrap();
+            prng.fill(buf.as_mut_slice());
+        }
+        let buf = Bytes::from(buf);
+
+        let mut outpathbuf = ti.tempdir().to_owned();
+        outpathbuf.push("stdout");
+        let mut errpathbuf = ti.tempdir().to_owned();
+        errpathbuf.push("stderr");
+
+        let stderr = tokio::fs::File::create(&errpathbuf).await.unwrap();
+
+        let args: &[Bytes] = &[
+            Bytes::from(b"randomgen".as_slice()),
+            Bytes::from(format!("{}", RANDOM_DATA_SIZE)),
+        ];
+
+        let logger = c.config().logger();
+
+        let id = c.create_command_channel(args).await.unwrap();
+        let mut finalrx = spawn_recv_process(c.clone()).await;
+
+        let perm = [1usize, 2, 0, 3];
+        const CHUNK_SIZE: usize = 2048;
+        const NUM_CHUNKS: usize = RANDOM_DATA_SIZE / CHUNK_SIZE;
+        let (msgtx, msgrx) = channel(20);
+        let (resptx, mut resprx) = channel(20);
+        let handler = c.clone().handler();
+        let msgproc = tokio::spawn(async move {
+            handler
+                .send_messages_from_channel::<WriteChannelRequest, WriteChannelResponse, Empty>(
+                    MessageKind::WriteChannel,
+                    msgrx,
+                    resptx,
+                )
+                .await;
+        });
+        let unwrapper = tokio::spawn(async move { while resprx.recv().await.is_some() {} });
+        for i in 0..NUM_CHUNKS {
+            let offset = (i & 0xfffc) | perm[i & 3];
+            let chunk = buf.slice(offset * CHUNK_SIZE..(offset + 1) * CHUNK_SIZE);
+            let req = WriteChannelRequest {
+                id,
+                selector: 0,
+                bytes: chunk,
+                stream_sync: Some((offset * CHUNK_SIZE) as u64),
+                blocking: Some(true),
+            };
+            msgtx.send(req).await.unwrap();
+        }
+        std::mem::drop(msgtx);
+        msgproc.await.unwrap();
+        c.clone().detach_channel_selector(id, 0).await;
+        unwrapper.await.unwrap();
+
+        let (msgtx, msgrx) = channel(20);
+        let (resptx, mut resprx) = channel(20);
+        let handler = c.clone().handler();
+        let msgproc = tokio::spawn(async move {
+            handler
+                .send_messages_from_channel::<ReadChannelRequest, ReadChannelResponse, Empty>(
+                    MessageKind::ReadChannel,
+                    msgrx,
+                    resptx,
+                )
+                .await;
+        });
+        for i in 0..NUM_CHUNKS {
+            let offset = (i & 0xfffc) | perm[i & 3];
+            let req = ReadChannelRequest {
+                id,
+                selector: 1,
+                count: CHUNK_SIZE as u64,
+                stream_sync: Some((offset * CHUNK_SIZE) as u64),
+                blocking: Some(true),
+                complete: true,
+            };
+            msgtx.send(req).await.unwrap();
+        }
+        // Read at the end, which will return EOF.
+        let req = ReadChannelRequest {
+            id,
+            selector: 1,
+            count: CHUNK_SIZE as u64,
+            stream_sync: Some((NUM_CHUNKS * CHUNK_SIZE) as u64),
+            blocking: Some(true),
+            complete: true,
+        };
+        msgtx.send(req).await.unwrap();
+        std::mem::drop(msgtx);
+        trace!(logger, "test: done sending read channel requests");
+        let bufwriter = tokio::spawn(async move {
+            let mut outbuf = vec![0u8; RANDOM_DATA_SIZE];
+            while let Some(resp) = resprx.recv().await {
+                trace!(logger, "test: received a response to read channel request");
+                let resp = resp.unwrap().unwrap();
+                let resp = match resp {
+                    protocol::ResponseValue::Success(r) => r,
+                    protocol::ResponseValue::Continuation(_) => panic!("unexpected continuation"),
+                };
+                let off = resp.offset.unwrap() as usize;
+                if resp.bytes.len() != 0 {
+                    outbuf[off..off + resp.bytes.len()].copy_from_slice(&resp.bytes);
+                }
+            }
+            trace!(logger, "test: no more responses");
+            outbuf
+        });
+        let logger = c.config().logger();
+        trace!(logger, "test: done sending read channel requests");
+        msgproc.await.unwrap();
+        trace!(logger, "test: done waiting for message sending task");
+
+        let stderr_task = c.clone().io_channel_read_task(id, 2, false, stderr);
+        trace!(logger, "test: spawned stderr task");
+        let outbuf = bufwriter.await.unwrap();
+        trace!(logger, "test: done waiting for read body");
+        c.clone().detach_channel_selector(id, 1).await;
+        trace!(logger, "test: done detaching channel selector 1");
+        assert_eq!(finalrx.recv().await.unwrap().unwrap(), 0);
+        trace!(logger, "test: done waiting on receiver to exit");
+        let _ = stderr_task.await.unwrap();
+        trace!(logger, "test: done waiting on tasks to join");
+        let digest = Sha256::digest(&outbuf);
+        trace!(logger, "test: done computing digest");
+        let errbuf = tokio::fs::read(&errpathbuf).await.unwrap();
+        let expected = format!("{} *-\n", hex::encode(digest));
+        assert_eq!(errbuf, b"", "no stderr");
+        assert_eq!(
+            expected.as_bytes(),
+            b"2361637e6d7170f46357a3714cfe290624d3af5580cdccd2a61c7c6282567004 *-\n",
+            "expected stdout"
+        );
+    });
+}
+
+#[test]
+fn can_send_out_of_order_packets_with_blocking_io() {
+    let mut capabilities = Capability::implemented();
+    capabilities.insert(Capability::ChannelBlockingIO);
+
+    let mut cb = ConfigBuilder::new();
+    cb.capabilities(capabilities);
+
+    let ti = Arc::new(TestInstance::new(Some(cb), None));
+    test_out_of_order_packets(ti);
 }
 
 #[test]

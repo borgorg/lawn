@@ -938,10 +938,21 @@ impl Server {
                 };
                 let selector = m.selector;
                 let count = m.count;
-                let data = tokio::task::spawn_blocking(move || ch.read(selector, count))
-                    .await
-                    .unwrap()?;
-                let resp = protocol::ReadChannelResponse { bytes: data };
+                let sync = m.stream_sync;
+                let blocking = m.blocking;
+                let complete = m.complete;
+                if sync.is_some() || blocking.is_some() || complete {
+                    assert_capability!(handler, protocol::Capability::ChannelBlockingIO);
+                }
+                let data = tokio::task::spawn_blocking(move || {
+                    ch.read(selector, count, sync, blocking, complete)
+                })
+                .await
+                .unwrap()?;
+                let resp = protocol::ReadChannelResponse {
+                    bytes: data,
+                    offset: sync,
+                };
                 Ok((ResponseType::Success, serializer.serialize_body(&resp)))
             }
             Some(MessageKind::WriteChannel) => {
@@ -954,10 +965,19 @@ impl Server {
                 };
                 let selector = m.selector;
                 let bytes = m.bytes;
-                let n = tokio::task::spawn_blocking(move || ch.write(selector, bytes))
-                    .await
-                    .unwrap()?;
-                let resp = protocol::WriteChannelResponse { count: n };
+                let sync = m.stream_sync;
+                let blocking = m.blocking;
+                if sync.is_some() || blocking.is_some() {
+                    assert_capability!(handler, protocol::Capability::ChannelBlockingIO);
+                }
+                let n =
+                    tokio::task::spawn_blocking(move || ch.write(selector, bytes, sync, blocking))
+                        .await
+                        .unwrap()?;
+                let resp = protocol::WriteChannelResponse {
+                    count: n,
+                    offset: sync,
+                };
                 Ok((ResponseType::Success, serializer.serialize_body(&resp)))
             }
             Some(MessageKind::DeleteChannel) => {

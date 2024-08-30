@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::encoding::{escape, path};
 use crate::error::{Error, ErrorKind};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use lawn_protocol::config::Logger;
 use lawn_protocol::handler;
 use lawn_protocol::handler::ProtocolHandler;
@@ -20,69 +20,21 @@ use num_traits::FromPrimitive;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_cbor::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::select;
+use tokio::sync::mpsc::channel;
 use tokio::task::JoinHandle;
-use tokio::time;
-
-#[derive(Clone)]
-pub struct FDStatus {
-    open: bool,
-    last: bool,
-    data: Option<Vec<u8>>,
-}
-
-impl FDStatus {
-    /// Returns true if read_command_fd should be called again when draining this stream.
-    fn needs_final_read(&self) -> bool {
-        self.open && self.last
-    }
-
-    /// Returns true if read_command_fd should be called again when draining this stream.
-    fn needs_final_write(&self) -> bool {
-        self.open
-    }
-
-    /// Returns true if read_command_fd should be called again.
-    fn needs_read(&self) -> bool {
-        self.open && self.last
-    }
-
-    /// Returns true if write_command_fd should be called again.
-    fn needs_write(&self) -> bool {
-        self.open && self.last
-    }
-
-    fn closed() -> FDStatus {
-        FDStatus {
-            open: false,
-            last: false,
-            data: None,
-        }
-    }
-}
-
-impl Default for FDStatus {
-    fn default() -> FDStatus {
-        FDStatus {
-            open: true,
-            last: false,
-            data: None,
-        }
-    }
-}
 
 pub struct Connection {
     config: Arc<Config>,
     path: Option<PathBuf>,
     handler: Arc<ProtocolHandler<OwnedReadHalf, OwnedWriteHalf>>,
+    capabilities: tokio::sync::RwLock<BTreeSet<protocol::Capability>>,
 }
 
 impl Connection {
@@ -100,7 +52,12 @@ impl Connection {
             config,
             path: path.map(|p| p.into()),
             handler,
+            capabilities: tokio::sync::RwLock::new(BTreeSet::new()),
         })
+    }
+
+    pub(crate) fn handler(&self) -> Arc<ProtocolHandler<OwnedReadHalf, OwnedWriteHalf>> {
+        self.handler.clone()
     }
 
     pub(crate) fn config(&self) -> Arc<Config> {
@@ -129,6 +86,12 @@ impl Connection {
     }
 
     #[allow(clippy::mutable_key_type)]
+    pub async fn set_capabilities(&self, set: BTreeSet<protocol::Capability>) {
+        let mut g = self.capabilities.write().await;
+        *g = set;
+    }
+
+    #[allow(clippy::mutable_key_type)]
     pub async fn negotiate_default_version(&self) -> Result<CapabilityResponse, Error> {
         let resp: CapabilityResponse = match self
             .handler
@@ -148,7 +111,7 @@ impl Connection {
             .cloned()
             .map(|c| c.into())
             .collect();
-        let intersection = ours
+        let intersection: Vec<_> = ours
             .intersection(&theirs)
             .map(|x| (*x).clone().into())
             .collect();
@@ -162,13 +125,15 @@ impl Connection {
         );
         let req = VersionRequest {
             version: 0,
-            enable: intersection,
+            enable: intersection.clone(),
             id: None,
             user_agent: Some(crate::config::VERSION.into()),
         };
         self.handler
             .send_message::<_, Empty, Empty>(MessageKind::Version, &req, Some(true))
             .await?;
+        let mut g = self.capabilities.write().await;
+        *g = intersection.iter().cloned().map(|x| x.into()).collect();
         Ok(resp)
     }
 
@@ -384,6 +349,7 @@ impl Connection {
         self: Arc<Self>,
         stdin: I,
         stdout: O,
+        stdout_isatty: bool,
         op: ClipboardChannelOperation,
         target: Option<ClipboardChannelTarget>,
     ) -> Result<i32, Error> {
@@ -402,13 +368,11 @@ impl Connection {
         let id = self.create_clipboard_channel(op, target).await?;
         match op {
             ClipboardChannelOperation::Copy => {
-                let mut fd_status = [FDStatus::default(), FDStatus::closed()];
-                self.run_channel(stdin, devnull, stderr, id, &mut fd_status)
+                self.run_channel(stdin, devnull, stderr, !stdout_isatty, id)
                     .await
             }
             ClipboardChannelOperation::Paste => {
-                let mut fd_status = [FDStatus::closed(), FDStatus::default()];
-                self.run_channel(devnull, stdout, stderr, id, &mut fd_status)
+                self.run_channel(devnull, stdout, stderr, !stdout_isatty, id)
                     .await
             }
         }
@@ -430,9 +394,7 @@ impl Connection {
             .await
             .unwrap();
         let id = self.create_9p_channel(target).await?;
-        let mut fd_status = [FDStatus::default(), FDStatus::default()];
-        self.run_channel(stdin, stdout, devnull, id, &mut fd_status)
-            .await
+        self.run_channel(stdin, stdout, devnull, false, id).await
     }
 
     pub async fn run_sftp<
@@ -451,9 +413,7 @@ impl Connection {
             .await
             .unwrap();
         let id = self.create_sftp_channel(target).await?;
-        let mut fd_status = [FDStatus::default(), FDStatus::default()];
-        self.run_channel(stdin, stdout, devnull, id, &mut fd_status)
-            .await
+        self.run_channel(stdin, stdout, devnull, false, id).await
     }
 
     pub async fn run_command<
@@ -466,14 +426,10 @@ impl Connection {
         stdin: I,
         stdout: O,
         stderr: E,
+        stdout_isatty: bool,
     ) -> Result<i32, Error> {
         let id = self.create_command_channel(args).await?;
-        let mut fd_status = [
-            FDStatus::default(),
-            FDStatus::default(),
-            FDStatus::default(),
-        ];
-        self.run_channel(stdin, stdout, stderr, id, &mut fd_status)
+        self.run_channel(stdin, stdout, stderr, !stdout_isatty, id)
             .await
     }
 
@@ -486,8 +442,8 @@ impl Connection {
         stdin: I,
         stdout: O,
         stderr: E,
+        complete: bool,
         id: ChannelID,
-        _fd_status: &mut [FDStatus],
     ) -> Result<i32, Error> {
         let rhandler = self.handler.clone();
         let (finaltx, mut finalrx) = tokio::sync::mpsc::channel(1);
@@ -506,8 +462,8 @@ impl Connection {
             }
         });
         self.clone().io_channel_write_task(id, 0, stdin);
-        let stdout_task = self.clone().io_channel_read_task(id, 1, stdout);
-        let stderr_task = self.clone().io_channel_read_task(id, 2, stderr);
+        let stdout_task = self.clone().io_channel_read_task(id, 1, complete, stdout);
+        let stderr_task = self.clone().io_channel_read_task(id, 2, false, stderr);
         let res = finalrx.recv().await;
         let _ = tokio::join!(stdout_task, stderr_task);
         let _ = self.delete_channel(id).await;
@@ -515,7 +471,7 @@ impl Connection {
         res.unwrap()
     }
 
-    fn io_channel_write_task<R: AsyncReadExt + Unpin + Send + 'static>(
+    pub(crate) fn io_channel_write_task<R: AsyncReadExt + Unpin + Send + 'static>(
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
@@ -528,90 +484,210 @@ impl Connection {
         })
     }
 
-    fn io_channel_read_task<W: AsyncWriteExt + Unpin + Send + 'static>(
+    pub(crate) fn io_channel_read_task<W: AsyncWriteExt + Unpin + Send + 'static>(
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
+        complete: bool,
         w: W,
     ) -> JoinHandle<Result<u64, Error>> {
         tokio::task::spawn(async move {
-            let r = self.clone().read_copy_command_fd(id, selector, w).await;
+            let r = self
+                .clone()
+                .read_copy_command_fd(id, selector, complete, w)
+                .await;
             self.detach_channel_selector(id, selector).await;
             r
         })
     }
 
-    async fn write_copy_command_fd<R: AsyncReadExt + Unpin>(
+    async fn write_copy_command_fd<R: AsyncReadExt + Unpin + Send + 'static>(
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
         r: R,
     ) -> Result<u64, Error> {
         let mut r = r;
-        let mut total = 0u64;
-        let mut buf = [0u8; 65536];
-        let mut off = 0;
-        let mut last = 0;
-        loop {
-            let (start, end) = if off == 0 {
-                let sz = match r.read(&mut buf).await {
-                    Ok(0) => {
-                        return Ok(total);
-                    }
-                    Ok(sz) => sz,
-                    Err(e) => return Err(handler::Error::from(protocol::Error::from(e)).into()),
-                };
-                (0, sz)
+        let (intx, mut inrx) = channel::<Result<Bytes, Error>>(20);
+        let (outtx, mut outrx) = channel(20);
+        let (msgtx, msgrx) = channel(20);
+        let (resptx, mut resprx) = channel(20);
+        let handler = self.handler.clone();
+        let config = self.config.clone();
+        let logger = self.config.logger();
+        let blocking = {
+            let capa = self.capabilities.read().await;
+            if capa.contains(&protocol::Capability::ChannelBlockingIO) {
+                Some(true)
             } else {
-                (off, last)
-            };
-            match self
-                .clone()
-                .write_channel(id, selector, &buf[start..end])
-                .await
-            {
-                Ok(written) if written as usize == end - start => {
-                    off = 0;
-                    last = 0;
-                    total += written;
-                }
-                Ok(written) => {
-                    off += written as usize;
-                    last = end;
-                    total += written;
-                }
-                Err(e) => match io::Error::try_from(e) {
-                    Ok(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        off = start;
-                        last = end;
-                        let mut selectors = BTreeMap::new();
-                        selectors.insert(1, PollChannelFlags::Output | PollChannelFlags::Hangup);
-                        let _ = Self::poll_channel(
-                            self.config.clone(),
-                            self.handler.clone(),
-                            id,
-                            &selectors,
-                        )
-                        .await;
-                        continue;
+                None
+            }
+        };
+        let msgproc = tokio::spawn(async move {
+            handler
+                .send_messages_from_channel::<WriteChannelRequest, WriteChannelResponse, Empty>(
+                    MessageKind::WriteChannel,
+                    msgrx,
+                    resptx,
+                )
+                .await;
+        });
+        let outtx2 = outtx.clone();
+        let sender = tokio::spawn(async move {
+            if blocking != Some(true) {
+                return;
+            }
+            while let Some(msg) = resprx.recv().await {
+                let resp = match msg {
+                    Ok(Some(ResponseValue::Success(resp))) => Ok(resp.count),
+                    Ok(Some(ResponseValue::Continuation(_))) => {
+                        Err(Error::new(ErrorKind::UnexpectedContinuation))
                     }
-                    Ok(e) => return Err(handler::Error::from(protocol::Error::from(e)).into()),
-                    Err(e) => return Err(e.0),
-                },
+                    Ok(None) => Err(Error::new(ErrorKind::MissingResponse)),
+                    Err(e) => Err(e.into()),
+                };
+                if outtx2.send(resp).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let writer = tokio::spawn(async move {
+            let mut total = 0u64;
+            while let Some(buf) = inrx.recv().await {
+                let buf = match buf {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        let _ = outtx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                if blocking == Some(true) {
+                    let req = WriteChannelRequest {
+                        id,
+                        selector,
+                        bytes: buf.clone(),
+                        stream_sync: Some(total),
+                        blocking,
+                    };
+                    trace!(
+                        logger,
+                        "blocking channel write: offset {}; {} bytes to write; new offset {}",
+                        total,
+                        buf.len(),
+                        total + (buf.len() as u64),
+                    );
+                    total += buf.len() as u64;
+                    if msgtx.send(req).await.is_err() {
+                        return;
+                    }
+                } else {
+                    let mut off = 0;
+                    while off < buf.len() {
+                        trace!(
+                            logger,
+                            "non-blocking channel write: offset {} of {} bytes",
+                            off,
+                            buf.len()
+                        );
+                        match self
+                            .clone()
+                            .write_channel(id, selector, buf.slice(off..))
+                            .await
+                        {
+                            Ok(written) => {
+                                off += written as usize;
+                                trace!(
+                                    logger,
+                                    "non-blocking channel write: wrote {} bytes; offset {}",
+                                    written,
+                                    off
+                                );
+                            }
+                            Err(e) => match io::Error::try_from(e) {
+                                Ok(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    let mut selectors = BTreeMap::new();
+                                    selectors.insert(
+                                        1,
+                                        PollChannelFlags::Output | PollChannelFlags::Hangup,
+                                    );
+                                    let _ = Self::poll_channel(
+                                        self.config.clone(),
+                                        self.handler.clone(),
+                                        id,
+                                        &selectors,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                Ok(e) => {
+                                    let _ = outtx
+                                        .send(Err(
+                                            handler::Error::from(protocol::Error::from(e)).into()
+                                        ))
+                                        .await;
+                                    return;
+                                }
+                                Err(e) => {
+                                    let _ = outtx.send(Err(e.0)).await;
+                                    return;
+                                }
+                            },
+                        }
+                    }
+                    if outtx.send(Ok(buf.len() as u64)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let reader = tokio::spawn(async move {
+            loop {
+                let mut buf = BytesMut::with_capacity(65536);
+                match r.read_buf(&mut buf).await {
+                    Ok(0) => return,
+                    Ok(sz) => sz,
+                    Err(e) => {
+                        let _ = intx
+                            .send(Err(handler::Error::from(protocol::Error::from(e)).into()))
+                            .await;
+                        return;
+                    }
+                };
+                let buf: Bytes = buf.into();
+                let _ = intx.send(Ok(buf)).await;
+            }
+        });
+        let logger = config.logger();
+        let mut total = 0u64;
+        while let Some(r) = outrx.recv().await {
+            match r {
+                Ok(n) => {
+                    trace!(logger, "channel write output ok: {} bytes", n);
+                    total += n;
+                }
+                Err(e) => {
+                    reader.abort();
+                    writer.abort();
+                    msgproc.abort();
+                    sender.abort();
+                    return Err(e);
+                }
             }
         }
+        Ok(total)
     }
 
     async fn read_copy_command_fd<W: AsyncWriteExt + Unpin>(
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
+        complete: bool,
         w: W,
     ) -> Result<u64, Error> {
         let mut w = w;
         let mut total = 0u64;
         loop {
-            let data = match self.clone().read_channel(id, selector).await {
+            let data = match self.clone().read_channel(id, selector, complete).await {
                 Ok(data) if data.is_empty() => return Ok(total),
                 Ok(data) => data,
                 Err(e) => match io::Error::try_from(e) {
@@ -640,7 +716,7 @@ impl Connection {
         }
     }
 
-    fn handle_async_run_message(
+    pub(crate) fn handle_async_run_message(
         handler: &ProtocolHandler<OwnedReadHalf, OwnedWriteHalf>,
         msg: &protocol::Message,
     ) -> Option<i32> {
@@ -703,268 +779,27 @@ impl Connection {
         Ok(resp.selectors)
     }
 
-    async fn write_command_fd<T: AsyncWriteExt + Unpin>(
+    async fn read_channel(
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
-        st: &FDStatus,
-        io: &mut T,
-    ) -> FDStatus {
-        let logger = self.config.logger();
-        if !st.open {
-            trace!(logger, "channel {}: closed selector {}", id, selector);
-            return st.clone();
-        }
-        let read_data;
-        let data: &[u8] = match &st.data {
-            Some(data) if !data.is_empty() => data,
-            Some(_) | None => {
-                trace!(
-                    logger,
-                    "channel {}: {}: about to read from channel",
-                    id,
-                    selector
-                );
-                match self.clone().read_channel(id, selector).await {
-                    Ok(data) => {
-                        trace!(
-                            logger,
-                            "channel {}: {}: read channel: {} bytes",
-                            id,
-                            selector,
-                            data.len()
-                        );
-                        read_data = data;
-                        &read_data
-                    }
-                    Err(e) => {
-                        trace!(
-                            logger,
-                            "channel {}: {}: read channel: error {}",
-                            id,
-                            selector,
-                            e
-                        );
-                        use std::error::Error;
-                        if let Some(e) = e.source() {
-                            if let Some(e) = e.downcast_ref::<protocol::Error>() {
-                                let e: Result<std::io::Error, _> = e.clone().try_into();
-                                if let Ok(e) = e {
-                                    match e.kind() {
-                                        std::io::ErrorKind::BrokenPipe => {
-                                            return FDStatus {
-                                                open: false,
-                                                last: false,
-                                                data: None,
-                                            }
-                                        }
-                                        std::io::ErrorKind::WouldBlock => {
-                                            return FDStatus {
-                                                open: true,
-                                                last: false,
-                                                data: None,
-                                            }
-                                        }
-                                        _ => return st.clone(),
-                                    }
-                                }
-                            }
-                        }
-                        return FDStatus {
-                            open: true,
-                            last: false,
-                            data: None,
-                        };
-                    }
-                }
+        complete: bool,
+    ) -> Result<Bytes, Error> {
+        let (blocking, complete) = {
+            let capa = self.capabilities.read().await;
+            if capa.contains(&protocol::Capability::ChannelBlockingIO) {
+                (Some(true), complete)
+            } else {
+                (None, false)
             }
         };
-        if data.is_empty() {
-            self.clone().detach_channel_selector(id, selector).await;
-            return FDStatus {
-                open: false,
-                last: false,
-                data: None,
-            };
-        }
-        trace!(
-            logger,
-            "channel {}: {}: about to write {} bytes to fd",
-            id,
-            selector,
-            data.len()
-        );
-        match io.write(data).await {
-            Ok(n) if n == data.len() => FDStatus {
-                open: true,
-                last: true,
-                data: None,
-            },
-            Ok(n) => FDStatus {
-                open: true,
-                last: true,
-                data: Some(data[n..].into()),
-            },
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::BrokenPipe => {
-                    self.clone().detach_channel_selector(id, selector).await;
-                    FDStatus {
-                        open: false,
-                        last: false,
-                        data: Some(data.into()),
-                    }
-                }
-                std::io::ErrorKind::WouldBlock => FDStatus {
-                    open: true,
-                    last: false,
-                    data: Some(data.into()),
-                },
-                _ => {
-                    trace!(logger, "channel {}: {}: error writing: {}", id, selector, e);
-                    FDStatus {
-                        open: true,
-                        last: false,
-                        data: Some(data.into()),
-                    }
-                }
-            },
-        }
-    }
-
-    async fn read_command_fd<T: AsyncReadExt + Unpin>(
-        self: Arc<Self>,
-        id: ChannelID,
-        selector: u32,
-        st: &FDStatus,
-        io: &mut T,
-    ) -> FDStatus {
-        let logger = self.config.logger();
-        if !st.open {
-            trace!(logger, "channel {}: closed selector {}", id, selector);
-            return st.clone();
-        }
-        let mut buf = vec![0; 65536];
-        let data = match &st.data {
-            Some(data) => data,
-            None => {
-                let mut interval = time::interval(Duration::from_millis(10));
-                trace!(
-                    logger,
-                    "channel {}: {}: about to read from fd",
-                    id,
-                    selector
-                );
-                select! {
-                    res = io.read(&mut buf) => {
-                        trace!(logger, "channel {}: {}: got {:?} on read", id, selector, res);
-                        match res {
-                            Ok(0) => {
-                                trace!(logger, "channel {}: {}: eof on read", id, selector);
-                                self.detach_channel_selector(id, selector).await;
-                                return FDStatus{open: false, last: false, data: None};
-                            },
-                            Ok(n) => &buf[0..n],
-                            Err(_) => return st.clone(),
-                        }
-                    }
-                    _ = interval.tick() => {
-                        trace!(logger, "channel {}: {}: nothing to read", id, selector);
-                        return FDStatus{open: st.open, last: false, data: st.data.clone()};
-                    }
-                }
-            }
-        };
-        trace!(
-            logger,
-            "channel {}: {}: about to write {} bytes to channel",
-            id,
-            selector,
-            data.len()
-        );
-        match self.write_channel(id, selector, data).await {
-            Ok(x) if x == data.len() as u64 => {
-                trace!(
-                    logger,
-                    "channel {}: {}: write channel: {} bytes",
-                    id,
-                    selector,
-                    x
-                );
-                FDStatus {
-                    open: true,
-                    last: true,
-                    data: None,
-                }
-            }
-            Ok(x) => {
-                trace!(
-                    logger,
-                    "channel {}: {}: write channel: {} bytes",
-                    id,
-                    selector,
-                    x
-                );
-                FDStatus {
-                    open: true,
-                    last: true,
-                    data: Some(data[(x as usize)..].to_vec()),
-                }
-            }
-            Err(e) => {
-                trace!(
-                    logger,
-                    "channel {}: {}: write channel: error {}",
-                    id,
-                    selector,
-                    e
-                );
-                use std::error::Error;
-                if let Some(e) = e.source() {
-                    if let Some(handler::Error::ProtocolError(e)) =
-                        e.downcast_ref::<handler::Error>()
-                    {
-                        let e: Result<std::io::Error, _> = e.clone().try_into();
-                        if let Ok(e) = e {
-                            match e.kind() {
-                                std::io::ErrorKind::BrokenPipe => {
-                                    return FDStatus {
-                                        open: false,
-                                        last: false,
-                                        data: None,
-                                    }
-                                }
-                                std::io::ErrorKind::WouldBlock => {
-                                    return FDStatus {
-                                        open: true,
-                                        last: false,
-                                        data: Some(data.to_vec()),
-                                    }
-                                }
-                                _ => {
-                                    return FDStatus {
-                                        open: true,
-                                        last: false,
-                                        data: Some(data.to_vec()),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                FDStatus {
-                    open: true,
-                    last: false,
-                    data: Some(data.to_vec()),
-                }
-            }
-        }
-    }
-
-    async fn read_channel(self: Arc<Self>, id: ChannelID, selector: u32) -> Result<Bytes, Error> {
         let req = ReadChannelRequest {
             id,
             selector,
             count: 65536,
+            stream_sync: None,
+            blocking,
+            complete,
         };
         let resp: ReadChannelResponse = match self
             .handler
@@ -984,12 +819,22 @@ impl Connection {
         self: Arc<Self>,
         id: ChannelID,
         selector: u32,
-        data: &[u8],
+        data: Bytes,
     ) -> Result<u64, Error> {
+        let blocking = {
+            let capa = self.capabilities.read().await;
+            if capa.contains(&protocol::Capability::ChannelBlockingIO) {
+                Some(true)
+            } else {
+                None
+            }
+        };
         let req = WriteChannelRequest {
             id,
             selector,
-            bytes: data.to_vec().into(),
+            bytes: data,
+            stream_sync: None,
+            blocking,
         };
         let resp: WriteChannelResponse = match self
             .handler
@@ -1005,7 +850,7 @@ impl Connection {
         Ok(resp.count)
     }
 
-    async fn detach_channel_selector(self: Arc<Self>, id: ChannelID, selector: u32) {
+    pub(crate) async fn detach_channel_selector(self: Arc<Self>, id: ChannelID, selector: u32) {
         let req = DetachChannelSelectorRequest { id, selector };
         let res = self
             .handler
@@ -1020,7 +865,7 @@ impl Connection {
         );
     }
 
-    async fn create_command_channel(&self, args: &[Bytes]) -> Result<ChannelID, Error> {
+    pub(crate) async fn create_command_channel(&self, args: &[Bytes]) -> Result<ChannelID, Error> {
         let config = self.config.clone();
         let req = CreateChannelRequest {
             kind: (b"command" as &'static [u8]).into(),

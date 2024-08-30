@@ -838,8 +838,14 @@ fn dispatch_clip(
             .await?;
         let _ = conn.negotiate_default_version().await;
         let _ = conn.auth_external().await;
-        conn.run_clipboard(tokio::io::stdin(), tokio::io::stdout(), op, target)
-            .await
+        conn.run_clipboard(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            rustix::termios::isatty(io::stdout()),
+            op,
+            target,
+        )
+        .await
     })?;
     std::process::exit(res);
 }
@@ -876,6 +882,7 @@ fn dispatch_run(
             tokio::io::stdin(),
             tokio::io::stdout(),
             tokio::io::stderr(),
+            rustix::termios::isatty(io::stdout()),
         )
         .await
     })?;

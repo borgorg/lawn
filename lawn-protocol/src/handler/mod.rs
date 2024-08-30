@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 
@@ -228,6 +228,110 @@ pub struct ProtocolHandler<T: AsyncRead, U: AsyncWrite> {
     capability: tokio::sync::RwLock<CapabilityData>,
     authenticated: tokio::sync::RwLock<bool>,
     synchronous: bool,
+}
+
+impl<T: AsyncRead + Unpin + Send + 'static, U: AsyncWrite + Unpin + Send + 'static>
+    ProtocolHandler<T, U>
+{
+    pub async fn send_messages_from_channel<
+        S: Serialize + Send + 'static,
+        D1: DeserializeOwned + Send + 'static,
+        D2: DeserializeOwned + Send + 'static,
+    >(
+        self: Arc<Self>,
+        kind: protocol::MessageKind,
+        input: Receiver<S>,
+        output: Sender<Result<Option<protocol::ResponseValue<D1, D2>>, Error>>,
+    ) -> u64 {
+        let mut input = input;
+        let mut processed = 0;
+        let (tx, mut rx) = channel(10);
+        let this = self.clone();
+        let max_messages = self.config.max_messages_in_flight();
+        let sem = Arc::new(tokio::sync::Semaphore::new(max_messages as usize / 4));
+        let (semtx, mut sem_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(body) = input.recv().await {
+                let id = {
+                    let mut g = this.id.lock().await;
+                    let v = *g;
+                    *g = this.config.next_id(v);
+                    v
+                };
+                let m = protocol::Message {
+                    id,
+                    kind: kind as u32,
+                    message: None,
+                };
+                let permit = sem.clone().acquire_owned().await.unwrap();
+                let resp = this.serializer.serialize_message_typed(&m, &body);
+                let msg = match resp {
+                    Some(m) => m,
+                    None => {
+                        if tx.send(Err(Error::Unserializable)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                if tx
+                    .send(this.send_message_only_internal(id, &msg, false).await)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = semtx.send(permit);
+            }
+        });
+        let mut joinset = tokio::task::JoinSet::new();
+        loop {
+            let recv = rx.recv().await;
+            if recv.is_none() {
+                break;
+            }
+            let permit = sem_rx.recv().await;
+            let output = output.clone();
+            joinset.spawn(async move {
+                let serializer = protocol::ProtocolSerializer::new();
+                match recv {
+                    Some(Ok(mut recv)) => {
+                        let m = match recv.recv().await {
+                            Some(Ok(m)) => m,
+                            Some(Err(e)) => {
+                                let _ = output.send(Err(e)).await;
+                                return;
+                            }
+                            None => {
+                                let _ = output.send(Err(Error::NoResponseReceived)).await;
+                                return;
+                            }
+                        };
+                        // We explicitly drop the permit as soon was we've read from the receiver
+                        // since that's the point at which the message is no longer in flight and
+                        // another can safely be sent.  Note that we don't want to hold it while
+                        // we're sending the response, as that channel might be full, and we
+                        // wouldn't want to block indefinitely for that reason.
+                        std::mem::drop(permit);
+                        let resp = match serializer.deserialize_response_typed(&m) {
+                            Ok(resp) => Ok(resp),
+                            Err(e) => Err(e.into()),
+                        };
+                        let _ = output.send(resp).await;
+                    }
+                    Some(Err(e)) => {
+                        std::mem::drop(permit);
+                        let _ = output.send(Err(e)).await;
+                    }
+                    None => (),
+                }
+            });
+        }
+        while joinset.join_next().await.is_some() {
+            processed += 1;
+        }
+        processed
+    }
 }
 
 impl<T: AsyncRead + Unpin, U: AsyncWrite + Unpin> ProtocolHandler<T, U> {
@@ -599,13 +703,12 @@ impl<T: AsyncRead + Unpin, U: AsyncWrite + Unpin> ProtocolHandler<T, U> {
             .await
     }
 
-    async fn send_message_internal<D1: DeserializeOwned, D2: DeserializeOwned>(
+    async fn send_message_only_internal(
         &self,
         id: u32,
         data: &Bytes,
         closing: bool,
-        synchronous: bool,
-    ) -> Result<(u32, Option<protocol::ResponseValue<D1, D2>>), Error> {
+    ) -> Result<Receiver<Result<protocol::Response, Error>>, Error> {
         let logger = self.config.logger();
         if !closing {
             let g = self.closing.read().await;
@@ -620,7 +723,7 @@ impl<T: AsyncRead + Unpin, U: AsyncWrite + Unpin> ProtocolHandler<T, U> {
             u32::from_le_bytes(data[8..12].try_into().unwrap())
         ));
         dump_packet!(logger, &data);
-        let (sender, mut receiver) = channel(1);
+        let (sender, receiver) = channel(1);
         let max_messages = self.config.max_messages_in_flight();
         let reject = {
             let mut g = self.requests.lock().await;
@@ -641,6 +744,18 @@ impl<T: AsyncRead + Unpin, U: AsyncWrite + Unpin> ProtocolHandler<T, U> {
             let mut g = self.outp.lock().await;
             g.as_mut().write_all(data).await?;
         }
+        Ok(receiver)
+    }
+
+    async fn send_message_internal<D1: DeserializeOwned, D2: DeserializeOwned>(
+        &self,
+        id: u32,
+        data: &Bytes,
+        closing: bool,
+        synchronous: bool,
+    ) -> Result<(u32, Option<protocol::ResponseValue<D1, D2>>), Error> {
+        let logger = self.config.logger();
+        let mut receiver = self.send_message_only_internal(id, data, closing).await?;
         if synchronous {
             trace!(logger, "synchronous mode: waiting for response");
             loop {
